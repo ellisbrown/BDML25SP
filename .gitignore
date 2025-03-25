@@ -1,11 +1,11 @@
 bash/
 datasets
 datasets/
+checkpoints/
 extracted_texts/
 processed_data/
 dataset_cache/
 wandb/
-
 
 # Created by https://www.toptal.com/developers/gitignore/api/data,linux,macos,python,jupyternotebooks
 # Edit at https://www.toptal.com/developers/gitignore?templates=data,linux,macos,python,jupyternotebooks
