@@ -19,6 +19,7 @@ import time
 import psutil
 import GPUtil
 import argparse
+import hashlib
 from datetime import datetime
 from transformers import (
     AutoModelForCausalLM,
@@ -29,7 +30,7 @@ from transformers import (
     BitsAndBytesConfig
 )
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
-from datasets import Dataset
+from datasets import Dataset, load_from_disk
 
 # Parse command-line arguments
 def parse_args():
@@ -42,6 +43,8 @@ def parse_args():
                         help="Directory containing preprocessed text data")
     parser.add_argument("--output_dir", type=str, default="./llama-finetuned",
                         help="Directory to save fine-tuned model and outputs")
+    parser.add_argument("--cache_dir", type=str, default="./dataset_cache",
+                        help="Directory to cache datasets")
 
     # Training parameters
     parser.add_argument("--train_test_split", type=float, default=0.9,
@@ -147,11 +150,12 @@ def log_gpu_usage():
     logging.info(f"RAM Usage: {ram.used/1e9:.1f}GB/{ram.total/1e9:.1f}GB ({ram.percent:.1f}%)")
 
 # Create directories if they don't exist
-def create_directories():
+def create_directories(data_dir, output_dir, cache_dir):
     """Create necessary directories."""
-    os.makedirs(args.data_dir, exist_ok=True)
-    os.makedirs(args.output_dir, exist_ok=True)
-    logging.info(f"Created directories: {args.data_dir}, {args.output_dir}")
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
+    logging.info(f"Created directories: {data_dir}, {output_dir}, {cache_dir}")
 
 # STEP 1: Data Processing - Extract text from PDFs
 def extract_text_from_pdfs(pdf_dir, output_dir):
@@ -193,32 +197,126 @@ def split_train_test(file_list, train_ratio=0.9):
     test_files = file_list[split_idx:]
     return train_files, test_files
 
-# STEP 3: Create datasets for training and evaluation
-def create_dataset(file_paths, tokenizer):
-    """Create dataset from text files."""
+# Function to hash file paths for caching
+def hash_file_paths(file_paths):
+    """Create a hash from a list of file paths to use as a cache key."""
+    # Sort to ensure consistent hash regardless of order
+    file_paths = sorted(file_paths)
+    # Create a string of all paths and their modification times for better caching
+    paths_string = ""
+    for path in file_paths:
+        mtime = os.path.getmtime(path)
+        paths_string += f"{path}:{mtime};"
+    # Create a hash
+    hash_obj = hashlib.md5(paths_string.encode())
+    return hash_obj.hexdigest()
+
+# Create raw text dataset with caching
+def create_text_dataset(file_paths, cache_dir, max_length=512):
+    """Create dataset of raw texts from files with caching."""
+    # Create a hash of the file paths to use as cache key
+    files_hash = hash_file_paths(file_paths)
+    cache_path = os.path.join(cache_dir, f"raw_dataset_{files_hash}")
+
+    # Check if cached dataset exists
+    if os.path.exists(cache_path):
+        logging.info(f"Loading raw text dataset from cache: {cache_path}")
+        return load_from_disk(cache_path)
+
+    logging.info("Cache not found, creating raw text dataset from files...")
     texts = []
 
-    for file_path in tqdm(file_paths, desc="Creating dataset"):
-        with open(file_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-            # Split text into chunks of max_length tokens
-            tokens = tokenizer.encode(text)
-            for i in range(0, len(tokens), args.max_length):
-                chunk = tokens[i:i + args.max_length]
-                if len(chunk) > 100:  # Skip very short chunks
-                    texts.append(tokenizer.decode(chunk))
+    for file_path in tqdm(file_paths, desc="Reading text files"):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+                # Process the text in chunks to avoid loading everything in memory
+                paragraphs = text.split("\n\n")
+                current_chunk = ""
 
-    return Dataset.from_dict({"text": texts})
+                for para in paragraphs:
+                    # If adding this paragraph would make the chunk too long, save current chunk and start a new one
+                    if len(current_chunk) + len(para) > max_length * 4:  # Rough character estimate
+                        if current_chunk:
+                            texts.append(current_chunk)
+                        current_chunk = para
+                    else:
+                        current_chunk += "\n\n" + para if current_chunk else para
 
-def tokenize_function(examples, tokenizer):
-    """Tokenize the text examples."""
-    return tokenizer(
-        examples["text"],
-        padding="max_length",
-        truncation=True,
-        max_length=args.max_length,
-        return_special_tokens_mask=True
-    )
+                # Add the last chunk if it's not empty
+                if current_chunk:
+                    texts.append(current_chunk)
+        except Exception as e:
+            logging.error(f"Error processing {file_path}: {e}")
+
+    # Create dataset from texts
+    dataset = Dataset.from_dict({"text": texts})
+
+    # Save to cache
+    logging.info(f"Saving raw text dataset to cache: {cache_path}")
+    dataset.save_to_disk(cache_path)
+
+    return dataset
+
+# Prepare and tokenize datasets with caching
+def prepare_datasets(train_files, test_files, tokenizer, cache_dir, max_length=512):
+    """Prepare and tokenize datasets with caching."""
+    # Create raw datasets or load from cache
+    train_raw_cache_dir = os.path.join(cache_dir, "raw_train")
+    eval_raw_cache_dir = os.path.join(cache_dir, "raw_eval")
+    os.makedirs(train_raw_cache_dir, exist_ok=True)
+    os.makedirs(eval_raw_cache_dir, exist_ok=True)
+
+    train_dataset = create_text_dataset(train_files, train_raw_cache_dir, max_length)
+    eval_dataset = create_text_dataset(test_files, eval_raw_cache_dir, max_length)
+
+    # Hash tokenizer configuration to include in cache key
+    tokenizer_config = f"{tokenizer.name_or_path}_{max_length}"
+    tokenizer_hash = hashlib.md5(tokenizer_config.encode()).hexdigest()
+
+    # Check for cached tokenized datasets
+    train_cache = os.path.join(cache_dir, f"tokenized_train_{tokenizer_hash}")
+    eval_cache = os.path.join(cache_dir, f"tokenized_eval_{tokenizer_hash}")
+
+    if os.path.exists(train_cache) and os.path.exists(eval_cache):
+        logging.info("Loading tokenized datasets from cache")
+        train_tokenized = load_from_disk(train_cache)
+        eval_tokenized = load_from_disk(eval_cache)
+    else:
+        logging.info("Tokenizing datasets")
+        # Define tokenization function
+        def tokenize_function(examples):
+            return tokenizer(
+                examples["text"],
+                padding="max_length",
+                truncation=True,
+                max_length=max_length,
+                return_special_tokens_mask=True
+            )
+
+        # Use datasets.map for efficient tokenization
+        train_tokenized = train_dataset.map(
+            tokenize_function,
+            batched=True,
+            num_proc=max(1, os.cpu_count() // 2),  # Use parallel processing but avoid using all cores
+            remove_columns=["text"],
+            desc="Tokenizing training dataset"
+        )
+
+        eval_tokenized = eval_dataset.map(
+            tokenize_function,
+            batched=True,
+            num_proc=max(1, os.cpu_count() // 2),
+            remove_columns=["text"],
+            desc="Tokenizing evaluation dataset"
+        )
+
+        # Save tokenized datasets to cache
+        logging.info(f"Saving tokenized datasets to cache: {train_cache} and {eval_cache}")
+        train_tokenized.save_to_disk(train_cache)
+        eval_tokenized.save_to_disk(eval_cache)
+
+    return train_tokenized, eval_tokenized
 
 # STEP 4: Configure model with memory optimizations
 def configure_model_for_fine_tuning():
@@ -331,23 +429,36 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
     trainer.train()
 
     # Save the model
-    trainer.save_model(OUTPUT_DIR)
+    trainer.save_model(args.output_dir)
     return trainer
 
 # STEP 7: Evaluate the model using perplexity
-def evaluate_perplexity(model, tokenizer, test_dataset):
+def evaluate_perplexity(model, tokenizer, eval_dataset):
     """Evaluate the model using perplexity metric."""
     model.eval()
     total_loss = 0
     total_tokens = 0
 
+    # Create a DataCollator for efficient batching
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False
+    )
+
+    # Create a dataloader for evaluation
+    eval_dataloader = torch.utils.data.DataLoader(
+        eval_dataset,
+        batch_size=4,  # Use small batch size for evaluation
+        collate_fn=data_collator
+    )
+
     with torch.no_grad():
-        for item in tqdm(test_dataset, desc="Evaluating perplexity"):
-            inputs = tokenizer(item["text"], return_tensors="pt").to(model.device)
-            outputs = model(**inputs, labels=inputs["input_ids"])
+        for batch in tqdm(eval_dataloader, desc="Evaluating perplexity"):
+            batch = {k: v.to(model.device) for k, v in batch.items()}
+            outputs = model(**batch)
             loss = outputs.loss.item()
-            total_loss += loss * inputs["input_ids"].size(1)
-            total_tokens += inputs["input_ids"].size(1)
+            total_loss += loss * batch["input_ids"].size(0) * batch["input_ids"].size(1)
+            total_tokens += batch["input_ids"].size(0) * batch["input_ids"].size(1)
 
     # Calculate perplexity
     perplexity = math.exp(total_loss / total_tokens)
@@ -357,18 +468,18 @@ def evaluate_perplexity(model, tokenizer, test_dataset):
 # STEP 8: Find maximum batch size through binary search
 def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
     """Binary search to find maximum batch size."""
-    min_batch = 1
-    max_batch = 128  # Start with a high upper bound for H100
-    optimal_batch = 1
+    min_batch = args.start_batch_size
+    max_batch = args.max_batch_size
+    optimal_batch = min_batch
 
     logging.info("Starting binary search for maximum batch size")
     logging.info(f"Initial search range: {min_batch} to {max_batch}")
 
     # First try a conservative batch size to establish a baseline
-    safe_batch_size = 8
+    safe_batch_size = args.safe_batch_size
     logging.info(f"Testing a safe batch size of {safe_batch_size} first")
     try:
-        grad_accum_steps = max(1, 32 // safe_batch_size)
+        grad_accum_steps = max(1, args.base_grad_accum // safe_batch_size)
         training_args = get_training_args(safe_batch_size, grad_accum_steps)
         trainer = Trainer(
             model=model,
@@ -405,7 +516,7 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
             min_batch = mid_batch + 1
             continue
 
-        grad_accum_steps = max(1, 32 // mid_batch)  # Ensure at least 1
+        grad_accum_steps = max(1, args.base_grad_accum // mid_batch)  # Ensure at least 1
         try:
             logging.info(f"Trying batch size: {mid_batch} with gradient accumulation steps: {grad_accum_steps}")
             log_gpu_usage()
@@ -469,7 +580,7 @@ def main():
 
     try:
         # Create necessary directories
-        create_directories()
+        create_directories(args.data_dir, args.output_dir, args.cache_dir)
 
         # Log initial GPU usage
         log_gpu_usage()
@@ -492,6 +603,14 @@ def main():
             txt_files = glob.glob(os.path.join(args.data_dir, "*.txt"))
             train_files, test_files = split_train_test(txt_files, args.train_test_split)
 
+            # Save the split information for future runs
+            split_info = {
+                "train_files": [os.path.basename(f) for f in train_files],
+                "test_files": [os.path.basename(f) for f in test_files]
+            }
+            with open(split_info_path, 'w') as f:
+                json.dump(split_info, f)
+
         logging.info(f"Training on {len(train_files)} files, testing on {len(test_files)} files")
 
         # Initialize model and tokenizer with memory optimizations
@@ -499,10 +618,15 @@ def main():
         model, tokenizer = configure_model_for_fine_tuning()
         log_gpu_usage()
 
-        # Create datasets
-        logging.info("Step 3: Creating datasets...")
-        train_dataset = create_dataset(train_files, tokenizer)
-        eval_dataset = create_dataset(test_files, tokenizer)
+        # Create datasets with caching
+        logging.info("Step 3: Creating and tokenizing datasets with caching...")
+        train_dataset, eval_dataset = prepare_datasets(
+            train_files,
+            test_files,
+            tokenizer,
+            cache_dir=args.cache_dir,
+            max_length=args.max_length
+        )
         logging.info(f"Train dataset size: {len(train_dataset)} samples")
         logging.info(f"Eval dataset size: {len(eval_dataset)} samples")
 
