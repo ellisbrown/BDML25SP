@@ -22,19 +22,19 @@ python llm_fine_tuning.py \
     --data_dir "$DATA_DIR" \
     --output_dir "$OUTPUT_DIR" \
     --learning_rate 2e-4 \
-    --num_epochs 3 \
+    --num_epochs 1 \
     --max_length 512 \
     --seed 42 \
-    --start_batch_size 4 \
+    --start_batch_size 2 \
     --max_batch_size 128 \
-    --safe_batch_size 8 \
+    --safe_batch_size 2 \
     --base_grad_accum 32 \
     --lora_r 8 \
     --lora_alpha 32 \
     --lora_dropout 0.1 \
-    --lora_target_modules "q_proj,k_proj,v_proj,o_proj" \
+    --lora_target_modules "q_proj,v_proj" \
     --load_in_4bit \
-    --use_fp16 \
+    --use_bf16 \
     --use_gradient_checkpointing \
     --use_8bit_optimizer \
     --use_double_quant \

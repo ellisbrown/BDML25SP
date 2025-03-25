@@ -325,9 +325,16 @@ def configure_model_for_fine_tuning():
     # Configure quantization
     quantization_config = None
     if args.load_in_4bit:
+
+        if args.use_fp16:
+            bnb_4bit_compute_dtype = torch.float16
+        elif args.use_bf16:
+            bnb_4bit_compute_dtype = torch.bfloat16
+        else:
+            bnb_4bit_compute_dtype = torch.float32
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
             bnb_4bit_use_double_quant=args.use_double_quant,
             bnb_4bit_quant_type="nf4"
         )
@@ -384,7 +391,7 @@ def get_training_args(batch_size, gradient_accumulation_steps):
         logging_steps=args.logging_steps,
         save_strategy="steps",
         save_steps=args.save_steps,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_total_limit=args.save_total_limit,
         report_to="none",
@@ -485,6 +492,7 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
             model=model,
             args=training_args,
             train_dataset=train_dataset.select(range(min(20, len(train_dataset)))),
+            eval_dataset=eval_dataset.select(range(min(20, len(eval_dataset)))),
             data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
         )
         trainer.train_dataloader = trainer.get_train_dataloader()
@@ -527,6 +535,7 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
                 model=model,
                 args=training_args,
                 train_dataset=train_dataset.select(range(min(20, len(train_dataset)))),
+                eval_dataset=eval_dataset.select(range(min(20, len(eval_dataset)))),
                 data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
             )
             trainer.train_dataloader = trainer.get_train_dataloader()
