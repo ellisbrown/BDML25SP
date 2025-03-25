@@ -115,18 +115,16 @@ def parse_args():
 
     return args
 
-# Set up global args
-args = parse_args()
-
 # Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("training.log"),
-        logging.StreamHandler()
-    ]
-)
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler("training.log"),
+            logging.StreamHandler()
+        ]
+    )
 
 # Function to monitor GPU usage
 def log_gpu_usage():
@@ -148,11 +146,11 @@ def log_gpu_usage():
     logging.info(f"RAM Usage: {ram.used/1e9:.1f}GB/{ram.total/1e9:.1f}GB ({ram.percent:.1f}%)")
 
 # Create directories if they don't exist
-def create_directories():
+def create_directories(txt_dir, output_dir):
     """Create necessary directories."""
-    os.makedirs(args.txt_dir, exist_ok=True)
-    os.makedirs(args.output_dir, exist_ok=True)
-    logging.info(f"Created directories: {args.txt_dir}, {args.output_dir}")
+    os.makedirs(txt_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    logging.info(f"Created directories: {txt_dir}, {output_dir}")
 
 # STEP 1: Data Processing - Extract text from PDFs
 def extract_text_from_pdfs(pdf_dir, output_dir):
@@ -195,7 +193,7 @@ def split_train_test(file_list, train_ratio=0.9):
     return train_files, test_files
 
 # STEP 3: Create datasets for training and evaluation
-def create_dataset(file_paths, tokenizer):
+def create_dataset(file_paths, tokenizer, max_length=512):
     """Create dataset from text files."""
     texts = []
 
@@ -204,67 +202,79 @@ def create_dataset(file_paths, tokenizer):
             text = f.read()
             # Split text into chunks of max_length tokens
             tokens = tokenizer.encode(text)
-            for i in range(0, len(tokens), args.max_length):
-                chunk = tokens[i:i + args.max_length]
+            for i in range(0, len(tokens), max_length):
+                chunk = tokens[i:i + max_length]
                 if len(chunk) > 100:  # Skip very short chunks
                     texts.append(tokenizer.decode(chunk))
 
     return Dataset.from_dict({"text": texts})
 
-def tokenize_function(examples, tokenizer):
+def tokenize_function(examples, tokenizer, max_length=512):
     """Tokenize the text examples."""
     return tokenizer(
         examples["text"],
         padding="max_length",
         truncation=True,
-        max_length=args.max_length,
+        max_length=max_length,
         return_special_tokens_mask=True
     )
 
 # STEP 4: Configure model with memory optimizations
-def configure_model_for_fine_tuning():
+def configure_model_for_fine_tuning(
+    model_path,
+    load_in_4bit=True,
+    load_in_8bit=False,
+    use_double_quant=True,
+    use_gradient_checkpointing=True,
+    lora_r=8,
+    lora_alpha=32,
+    lora_target_modules=None,
+    lora_dropout=0.1
+):
     """Configure LLaMA model with memory optimizations."""
+    if lora_target_modules is None:
+        lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
     # Configure quantization
     quantization_config = None
-    if args.load_in_4bit:
+    if load_in_4bit:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=args.use_double_quant,
+            bnb_4bit_use_double_quant=use_double_quant,
             bnb_4bit_quant_type="nf4"
         )
-    elif args.load_in_8bit:
+    elif load_in_8bit:
         quantization_config = BitsAndBytesConfig(
             load_in_8bit=True
         )
 
     # Load the model with quantization
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+        model_path,
         quantization_config=quantization_config,
         device_map="auto",
         trust_remote_code=True
     )
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.eos_token
 
     # Prepare model for k-bit training
     model = prepare_model_for_kbit_training(model)
 
     # Enable gradient checkpointing if requested
-    if args.use_gradient_checkpointing:
+    if use_gradient_checkpointing:
         model.gradient_checkpointing_enable()
         logging.info("Gradient checkpointing enabled")
 
     # Configure LoRA
     lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=args.lora_target_modules,
-        lora_dropout=args.lora_dropout,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        target_modules=lora_target_modules,
+        lora_dropout=lora_dropout,
         bias="none",
         task_type=TaskType.CAUSAL_LM
     )
@@ -276,27 +286,65 @@ def configure_model_for_fine_tuning():
     return model, tokenizer
 
 # STEP 5: Configure training arguments
-def get_training_args(batch_size, gradient_accumulation_steps):
+def get_training_args(
+    output_dir,
+    batch_size,
+    gradient_accumulation_steps,
+    learning_rate=2e-4,
+    num_epochs=3,
+    use_fp16=True,
+    use_bf16=False,
+    use_8bit_optimizer=True,
+    logging_steps=10,
+    eval_steps=100,
+    save_steps=500,
+    save_total_limit=1
+):
     """Get training arguments with memory optimizations."""
-    return TrainingArguments(
-        output_dir=OUTPUT_DIR,
+    training_args = TrainingArguments(
+        output_dir=output_dir,
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=2e-4,
-        fp16=True,                         # Use mixed precision training
-        logging_steps=10,
-        num_train_epochs=3,
-        save_strategy="epoch",
-        evaluation_strategy="epoch",
-        save_total_limit=1,
+        learning_rate=learning_rate,
+        num_train_epochs=num_epochs,
+        logging_steps=logging_steps,
+        save_strategy="steps",
+        save_steps=save_steps,
+        evaluation_strategy="steps",
+        eval_steps=eval_steps,
+        save_total_limit=save_total_limit,
         report_to="none",
-        optim="paged_adamw_8bit",         # Use 8-bit Adam optimizer for memory efficiency
     )
 
+    # Set precision flags
+    if use_fp16:
+        training_args.fp16 = True
+    if use_bf16:
+        training_args.bf16 = True
+
+    # Set optimizer
+    if use_8bit_optimizer:
+        training_args.optim = "paged_adamw_8bit"
+
+    return training_args
+
 # STEP 6: Train the model
-def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gradient_accumulation_steps=8):
+def train_model(
+    model,
+    tokenizer,
+    train_dataset,
+    eval_dataset,
+    output_dir,
+    batch_size=1,
+    gradient_accumulation_steps=8,
+    learning_rate=2e-4,
+    num_epochs=3,
+    use_fp16=True,
+    use_bf16=False,
+    use_8bit_optimizer=True
+):
     """Train the model with memory optimizations."""
-    print(f"Training with batch size: {batch_size}, grad accum: {gradient_accumulation_steps}")
+    logging.info(f"Training with batch size: {batch_size}, grad accum: {gradient_accumulation_steps}")
 
     # Use DataCollator for language modeling
     data_collator = DataCollatorForLanguageModeling(
@@ -305,7 +353,16 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
     )
 
     # Configure training arguments
-    training_args = get_training_args(batch_size, gradient_accumulation_steps)
+    training_args = get_training_args(
+        output_dir=output_dir,
+        batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=learning_rate,
+        num_epochs=num_epochs,
+        use_fp16=use_fp16,
+        use_bf16=use_bf16,
+        use_8bit_optimizer=use_8bit_optimizer
+    )
 
     # Initialize Trainer
     trainer = Trainer(
@@ -320,7 +377,7 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
     trainer.train()
 
     # Save the model
-    trainer.save_model(OUTPUT_DIR)
+    trainer.save_model(output_dir)
     return trainer
 
 # STEP 7: Evaluate the model using perplexity
@@ -340,25 +397,38 @@ def evaluate_perplexity(model, tokenizer, test_dataset):
 
     # Calculate perplexity
     perplexity = math.exp(total_loss / total_tokens)
-    print(f"Perplexity: {perplexity:.2f}")
+    logging.info(f"Perplexity: {perplexity:.2f}")
     return perplexity
 
 # STEP 8: Find maximum batch size through binary search
-def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
+def find_max_batch_size(
+    model,
+    tokenizer,
+    train_dataset,
+    eval_dataset,
+    output_dir,
+    start_batch_size=1,
+    max_batch_size=128,
+    safe_batch_size=8,
+    base_grad_accum=32
+):
     """Binary search to find maximum batch size."""
-    min_batch = 1
-    max_batch = 128  # Start with a high upper bound for H100
-    optimal_batch = 1
+    min_batch = start_batch_size
+    max_batch = max_batch_size
+    optimal_batch = start_batch_size
 
     logging.info("Starting binary search for maximum batch size")
     logging.info(f"Initial search range: {min_batch} to {max_batch}")
 
     # First try a conservative batch size to establish a baseline
-    safe_batch_size = 8
     logging.info(f"Testing a safe batch size of {safe_batch_size} first")
     try:
-        grad_accum_steps = max(1, 32 // safe_batch_size)
-        training_args = get_training_args(safe_batch_size, grad_accum_steps)
+        grad_accum_steps = max(1, base_grad_accum // safe_batch_size)
+        training_args = get_training_args(
+            output_dir=output_dir,
+            batch_size=safe_batch_size,
+            gradient_accumulation_steps=grad_accum_steps
+        )
         trainer = Trainer(
             model=model,
             args=training_args,
@@ -394,13 +464,17 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
             min_batch = mid_batch + 1
             continue
 
-        grad_accum_steps = max(1, 32 // mid_batch)  # Ensure at least 1
+        grad_accum_steps = max(1, base_grad_accum // mid_batch)  # Ensure at least 1
         try:
             logging.info(f"Trying batch size: {mid_batch} with gradient accumulation steps: {grad_accum_steps}")
             log_gpu_usage()
 
             # Test if this batch size works by running one training step
-            training_args = get_training_args(mid_batch, grad_accum_steps)
+            training_args = get_training_args(
+                output_dir=output_dir,
+                batch_size=mid_batch,
+                gradient_accumulation_steps=grad_accum_steps
+            )
             trainer = Trainer(
                 model=model,
                 args=training_args,
@@ -440,7 +514,7 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
     logging.info(f"Maximum batch size found: {optimal_batch}")
     return optimal_batch
 
-def main():
+def main(args):
     """Main function to run the fine-tuning pipeline."""
     start_time = time.time()
     logging.info("Starting LLaMA fine-tuning with memory optimizations")
@@ -464,7 +538,7 @@ def main():
 
     try:
         # Create necessary directories
-        create_directories()
+        create_directories(args.txt_dir, args.output_dir)
 
         # Log initial GPU usage
         log_gpu_usage()
@@ -480,25 +554,58 @@ def main():
 
         # Initialize model and tokenizer with memory optimizations
         logging.info("Step 3: Configuring model with memory optimizations...")
-        model, tokenizer = configure_model_for_fine_tuning()
+        model, tokenizer = configure_model_for_fine_tuning(
+            model_path=args.model_path,
+            load_in_4bit=args.load_in_4bit,
+            load_in_8bit=args.load_in_8bit,
+            use_double_quant=args.use_double_quant,
+            use_gradient_checkpointing=args.use_gradient_checkpointing,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_target_modules=args.lora_target_modules,
+            lora_dropout=args.lora_dropout
+        )
         log_gpu_usage()
 
         # Create datasets
         logging.info("Step 4: Creating datasets...")
-        train_dataset = create_dataset(train_files, tokenizer)
-        eval_dataset = create_dataset(test_files, tokenizer)
+        train_dataset = create_dataset(train_files, tokenizer, max_length=args.max_length)
+        eval_dataset = create_dataset(test_files, tokenizer, max_length=args.max_length)
         logging.info(f"Train dataset size: {len(train_dataset)} samples")
         logging.info(f"Eval dataset size: {len(eval_dataset)} samples")
 
         # Find maximum batch size
         logging.info("Step 5: Finding maximum batch size...")
-        max_batch_size = find_max_batch_size(model, tokenizer, train_dataset, eval_dataset)
+        max_batch_size = find_max_batch_size(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            output_dir=args.output_dir,
+            start_batch_size=args.start_batch_size,
+            max_batch_size=args.max_batch_size,
+            safe_batch_size=args.safe_batch_size,
+            base_grad_accum=args.base_grad_accum
+        )
         log_gpu_usage()
 
         # Train the model with the optimal batch size
         logging.info(f"Step 6: Training model with batch size {max_batch_size}...")
         grad_accum_steps = max(1, args.base_grad_accum // max_batch_size)  # Ensure at least 1
-        trainer = train_model(model, tokenizer, train_dataset, eval_dataset, max_batch_size, grad_accum_steps)
+        trainer = train_model(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            output_dir=args.output_dir,
+            batch_size=max_batch_size,
+            gradient_accumulation_steps=grad_accum_steps,
+            learning_rate=args.learning_rate,
+            num_epochs=args.num_epochs,
+            use_fp16=args.use_fp16,
+            use_bf16=args.use_bf16,
+            use_8bit_optimizer=args.use_8bit_optimizer
+        )
         log_gpu_usage()
 
         # Evaluate the model
@@ -536,4 +643,11 @@ def main():
         raise
 
 if __name__ == "__main__":
-    main()
+    # Parse command-line arguments
+    args = parse_args()
+
+    # Set up logging
+    setup_logging()
+
+    # Run the main function
+    main(args)
