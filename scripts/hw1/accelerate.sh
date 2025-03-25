@@ -14,7 +14,7 @@ mkdir -p "$OUTPUT_DIR"
 mkdir -p "$LOGS_DIR"
 
 # Set GPU device
-GPU_IDS=1
+GPU_IDS=0
 export CUDA_VISIBLE_DEVICES=$GPU_IDS
 
 # First run 'accelerate config' once to set up configuration
@@ -30,7 +30,7 @@ accelerate launch \
     --num_epochs 1 \
     --max_length 512 \
     --seed 42 \
-    --start_batch_size 2 \
+    --start_batch_size 24 \
     --max_batch_size 32 \
     --safe_batch_size 2 \
     --base_grad_accum 1 \

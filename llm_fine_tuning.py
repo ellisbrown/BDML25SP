@@ -1,3 +1,4 @@
+import gc
 import os
 import glob
 import json
@@ -162,7 +163,7 @@ def log_gpu_usage(log_to_wandb=False):
                 gpu_metrics[f"gpu_{gpu.id}_memory_util_pct"] = gpu.memoryUtil * 100
 
         if gpu_info:
-            logging.info("GPU Memory Usage: " + ", ".join(gpu_info))
+            logging.info("\nGPU Memory Usage: " + ", ".join(gpu_info))
     except Exception as e:
         logging.warning(f"Failed to log GPU usage: {e}")
 
@@ -488,9 +489,9 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
     max_eval_samples = 256
     if len(eval_dataset) > max_eval_samples:
         logging.info(f"Limiting evaluation samples to {max_eval_samples} during training (actual: {len(eval_dataset)})")
-        eval_dataset = eval_dataset.select(range(max_eval_samples))
-        # # random sample
-        # eval_dataset = eval_dataset.select(random.sample(range(len(eval_dataset)), max_eval_samples))
+        # eval_dataset = eval_dataset.select(range(max_eval_samples))
+        # random sample
+        eval_dataset = eval_dataset.select(random.sample(range(len(eval_dataset)), max_eval_samples))
 
     # Log to wandb
     use_wandb = args.use_wandb and wandb.run is not None
@@ -588,15 +589,27 @@ def evaluate_perplexity(model, tokenizer, eval_dataset):
 
     # Log perplexity to wandb if enabled
     if args.use_wandb and wandb.run is not None:
-        wandb.log({"eval/perplexity": perplexity})
+        wandb.log({"eval/pplx": perplexity})
 
     return perplexity
 
 # STEP 8: Find maximum batch size through binary search
 def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
-    """Binary search to find maximum batch size."""
+    """Binary search to find maximum batch size with improved memory cleanup."""
+    # CRITICAL: Do thorough memory cleanup before starting
+    model.zero_grad(set_to_none=True)
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()  # Reset peak stats for clean measurement
+
+    # Force a full GPU memory check
+    initial_memory_allocated = torch.cuda.memory_allocated(0)
+    initial_memory_reserved = torch.cuda.memory_reserved(0)
+    logging.info(f"Initial GPU memory state - Allocated: {initial_memory_allocated/1e9:.2f}GB, Reserved: {initial_memory_reserved/1e9:.2f}GB")
+
     min_batch = args.start_batch_size
     max_batch = args.max_batch_size
+    optimal_batch = min_batch
     optimal_batch = min_batch
 
     logging.info("Starting binary search for maximum batch size")
@@ -614,35 +627,22 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
     safe_batch_size = args.safe_batch_size
     logging.info(f"Testing a safe batch size of {safe_batch_size} first")
     try:
-        grad_accum_steps = max(1, args.base_grad_accum // safe_batch_size)
-        training_args = get_training_args(safe_batch_size, grad_accum_steps)
-        trainer = PplxTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset.select(range(min(20, len(train_dataset)))),
-            eval_dataset=eval_dataset.select(range(min(20, len(eval_dataset)))),
-            data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
-        )
-        trainer.train_dataloader = trainer.get_train_dataloader()
-        batch = next(iter(trainer.train_dataloader))
-        batch = {k: v.to(model.device) for k, v in batch.items()}
+        result = test_batch_size(model, tokenizer, train_dataset, eval_dataset, safe_batch_size)
 
-        # Try one forward and backward pass
-        outputs = model(**batch)
-        loss = outputs.loss
-        loss.backward()
+        if result == "success":
+            min_batch = safe_batch_size
+            logging.info(f"Safe batch size {safe_batch_size} works! Continuing search...")
 
-        # If successful, we know this works
-        optimal_batch = safe_batch_size
-        min_batch = safe_batch_size
-        logging.info(f"Safe batch size {safe_batch_size} works! Continuing search...")
-
-        # Log to wandb
-        if args.use_wandb and wandb.run is not None:
-            wandb.log({
-                "batch_search/safe_batch_size_success": True,
-                "batch_search/current_optimal": optimal_batch
-            })
+            # Log to wandb
+            if args.use_wandb and wandb.run is not None:
+                wandb.log({
+                    "batch_search/safe_batch_size_success": True,
+                    "batch_search/current_optimal": optimal_batch
+                })
+        else:
+            # If safe batch size fails, fall back to batch size 1
+            min_batch = 1
+            logging.warning(f"Safe batch size {safe_batch_size} failed. Falling back to batch size 1")
     except Exception as e:
         logging.warning(f"Even safe batch size {safe_batch_size} failed: {e}")
         logging.info("Falling back to batch size 1")
@@ -655,9 +655,6 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
             })
         return 1
 
-    # Release memory before continuing
-    torch.cuda.empty_cache()
-
     # Binary search
     while min_batch <= max_batch:
         mid_batch = (min_batch + max_batch) // 2
@@ -666,77 +663,34 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
             min_batch = mid_batch + 1
             continue
 
+        # Test this batch size
         grad_accum_steps = max(1, args.base_grad_accum // mid_batch)  # Ensure at least 1
-        try:
-            logging.info(f"Trying batch size: {mid_batch} with gradient accumulation steps: {grad_accum_steps}")
-            log_gpu_usage(log_to_wandb=True)
+        result = test_batch_size(model, tokenizer, train_dataset, eval_dataset, mid_batch, grad_accum_steps)
 
-            # Test if this batch size works by running one training step
-            training_args = get_training_args(mid_batch, grad_accum_steps)
-            trainer = PplxTrainer(
-                model=model,
-                args=training_args,
-                train_dataset=train_dataset.select(range(min(20, len(train_dataset)))),
-                eval_dataset=eval_dataset.select(range(min(20, len(eval_dataset)))),
-                data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
-            )
-            trainer.train_dataloader = trainer.get_train_dataloader()
-            batch = next(iter(trainer.train_dataloader))
-            batch = {k: v.to(model.device) for k, v in batch.items()}
+        logs = {
+            "batch_search/tried_batch_size": mid_batch,
+            "batch_search/gradient_accumulation": grad_accum_steps,
+            "batch_search/effective_batch": mid_batch * grad_accum_steps,
+            "batch_search/current_optimal": optimal_batch,
+            "batch_search/min_bound": min_batch,
+            "batch_search/max_bound": max_batch,
+        }
 
-            # Try one forward and backward pass
-            outputs = model(**batch)
-            loss = outputs.loss
-            loss.backward()
-
-            # If successful, this batch size works
+        if result == "success":
             optimal_batch = mid_batch
-            logging.info(f"Batch size {mid_batch} works!")
             min_batch = mid_batch + 1
+            logs["batch_search/batch_success"] = True
+        else:
+            # If failed, reduce the max batch size
+            max_batch = mid_batch - 1
+            logs.update({
+                "batch_search/batch_success": False,
+                "batch_search/oom_error": result == "oom",
+            })
 
-            # Log to wandb
-            if args.use_wandb and wandb.run is not None:
-                wandb.log({
-                    "batch_search/tried_batch_size": mid_batch,
-                    "batch_search/batch_success": True,
-                    "batch_search/gradient_accumulation": grad_accum_steps,
-                    "batch_search/effective_batch": mid_batch * grad_accum_steps,
-                    "batch_search/current_optimal": optimal_batch
-                })
-        except RuntimeError as e:
-            if "CUDA out of memory" in str(e) or "not enough memory" in str(e):
-                # If OOM error, try smaller batch size
-                logging.info(f"OOM error at batch size {mid_batch}")
-                max_batch = mid_batch - 1
-
-                # Log to wandb
-                if args.use_wandb and wandb.run is not None:
-                    wandb.log({
-                        "batch_search/tried_batch_size": mid_batch,
-                        "batch_search/batch_success": False,
-                        "batch_search/oom_error": True,
-                        "batch_search/new_max_bound": max_batch
-                    })
-            else:
-                # For other errors, log and try smaller batch size
-                logging.warning(f"Error at batch size {mid_batch}: {e}")
-                max_batch = mid_batch - 1
-
-                # Log to wandb
-                if args.use_wandb and wandb.run is not None:
-                    wandb.log({
-                        "batch_search/tried_batch_size": mid_batch,
-                        "batch_search/batch_success": False,
-                        "batch_search/other_error": True,
-                        "batch_search/new_max_bound": max_batch
-                    })
-
-        # Always clean up GPU memory after each test
-        model.zero_grad(set_to_none=True)
-        torch.cuda.empty_cache()
-
-        # Brief pause to let GPU recover
-        time.sleep(2)
+        # Log to wandb
+        if args.use_wandb and wandb.run is not None:
+            wandb.log(logs)
 
     logging.info(f"Maximum batch size found: {optimal_batch}")
 
@@ -751,6 +705,72 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
 
     return optimal_batch
 
+
+def test_batch_size(model, tokenizer, train_dataset, eval_dataset, batch_size, grad_accum_steps=1):
+    result = "fail"
+
+    try:
+        logging.info(f"Trying batch size: {batch_size} with gradient accumulation steps: {grad_accum_steps}")
+        log_gpu_usage(log_to_wandb=True)
+
+        # Test if this batch size works by running one training step
+        training_args = get_training_args(batch_size, grad_accum_steps)
+        trainer = PplxTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+        )
+        trainer.train_dataloader = trainer.get_train_dataloader()
+        batch = next(iter(trainer.train_dataloader))
+        batch = {k: v.to(model.device) for k, v in batch.items()}
+
+        # Try one forward and backward pass
+        outputs = model(**batch)
+        loss = outputs.loss
+        loss.backward()
+
+        # If successful, this batch size works
+        logging.info(f"Batch size {batch_size} works!")
+        result = "success"
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e) or "not enough memory" in str(e):
+            # If OOM error, try smaller batch size
+            logging.info(f"OOM error at batch size {batch_size}")
+            result = "oom"
+        else:
+            # For other errors, log and try smaller batch size
+            logging.warning(f"Error at batch size {batch_size}: {e}")
+            result = "fail"
+    except Exception as e:
+        # For other errors, log and try smaller batch size
+        logging.warning(f"Error at batch size {batch_size}: {e}")
+        result = "fail"
+
+    loss = None
+    del loss
+    outputs = None
+    del outputs
+    batch = None
+    del batch
+    trainer = None
+    del trainer
+    training_args = None
+    del training_args
+
+    # Always clean up GPU memory after each test
+    model.zero_grad(set_to_none=True)
+    gc.collect()
+
+    torch.cuda.empty_cache()
+
+    # Brief pause to let GPU recover
+    time.sleep(2)
+
+    log_gpu_usage(log_to_wandb=True)
+
+    return result
 
 def main():
     """Main function to run the fine-tuning pipeline."""
@@ -842,7 +862,10 @@ def main():
 
         # Find maximum batch size
         logging.info("Step 4: Finding maximum batch size...")
-        max_batch_size = find_max_batch_size(model, tokenizer, train_dataset, eval_dataset)
+        max_batch_size = find_max_batch_size(model, tokenizer,
+            train_dataset.select(range(256)),
+            eval_dataset.select(range(256)),
+        )
         log_gpu_usage()
 
         # Train the model with the optimal batch size
@@ -872,7 +895,7 @@ def main():
         # Final metrics to wandb
         if args.use_wandb and wandb.run is not None:
             wandb.log({
-                "train/final_perplexity": perplexity,
+                "train/final_pplx": perplexity,
                 "train/max_batch_size": max_batch_size,
                 "train/grad_accum_steps": grad_accum_steps,
                 "train/effective_batch_size": max_batch_size * grad_accum_steps,
