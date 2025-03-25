@@ -420,6 +420,7 @@ def get_training_args(batch_size, gradient_accumulation_steps):
         save_total_limit=args.save_total_limit,
         report_to=report_to,
         run_name=args.wandb_run_name if args.use_wandb else None,
+        label_names=["labels"],  # Add this line to silence Peft warning
     )
 
     # Set precision flags
@@ -501,7 +502,6 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         callbacks=[GPULoggingCallback()],
-        label_names=["labels"],  # Add this line to silence Peft warning
     )
 
     # Train the model
@@ -588,7 +588,6 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
             train_dataset=train_dataset.select(range(min(20, len(train_dataset)))),
             eval_dataset=eval_dataset.select(range(min(20, len(eval_dataset)))),
             data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
-            label_names=["labels"],  # Add this line to silence Peft warning
         )
         trainer.train_dataloader = trainer.get_train_dataloader()
         batch = next(iter(trainer.train_dataloader))
@@ -646,7 +645,6 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
                 train_dataset=train_dataset.select(range(min(20, len(train_dataset)))),
                 eval_dataset=eval_dataset.select(range(min(20, len(eval_dataset)))),
                 data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
-                label_names=["labels"],  # Add this line to silence Peft warning
             )
             trainer.train_dataloader = trainer.get_train_dataloader()
             batch = next(iter(trainer.train_dataloader))
