@@ -11,7 +11,7 @@ DATA_DIR="./processed_data"
 OUTPUT_DIR="./llama-finetuned"
 
 # Set GPU device
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=2
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -32,7 +32,7 @@ python llm_fine_tuning.py \
     --lora_r 8 \
     --lora_alpha 32 \
     --lora_dropout 0.1 \
-    --lora_target_modules "q_proj,v_proj" \
+    --lora_target_modules "q_proj,k_proj,v_proj,o_proj"  \
     --load_in_4bit \
     --use_bf16 \
     --use_gradient_checkpointing \
