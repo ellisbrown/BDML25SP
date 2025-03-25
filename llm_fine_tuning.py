@@ -408,6 +408,7 @@ def get_training_args(batch_size, gradient_accumulation_steps):
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         num_train_epochs=args.num_epochs,
@@ -439,7 +440,8 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
     print(f"Training with batch size: {batch_size}, grad accum: {gradient_accumulation_steps}")
 
     # Log to wandb
-    if args.use_wandb and wandb.run is not None:
+    use_wandb = args.use_wandb and wandb.run is not None
+    if use_wandb:
         wandb.log({
             "training/batch_size": batch_size,
             "training/grad_accum_steps": gradient_accumulation_steps,
@@ -491,9 +493,13 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
         metrics = train_result.metrics
         wandb.log({f"training/{k}": v for k, v in metrics.items()})
 
+    # Run final evaluation
+    eval_metrics = trainer.evaluate()
+    logging.info(f"Final evaluation metrics: {eval_metrics}")
+
     # Save the model
     trainer.save_model(args.output_dir)
-    return trainer
+    return trainer, metrics, eval_metrics
 
 # STEP 7: Evaluate the model using perplexity
 def evaluate_perplexity(model, tokenizer, eval_dataset):
@@ -789,7 +795,7 @@ def main():
         # Train the model with the optimal batch size
         logging.info(f"Step 5: Training model with batch size {max_batch_size}...")
         grad_accum_steps = max(1, args.base_grad_accum // max_batch_size)  # Ensure at least 1
-        trainer = train_model(model, tokenizer, train_dataset, eval_dataset, max_batch_size, grad_accum_steps)
+        trainer, train_metrics, eval_metrics = train_model(model, tokenizer, train_dataset, eval_dataset, max_batch_size, grad_accum_steps)
         log_gpu_usage()
 
         # Evaluate the model
