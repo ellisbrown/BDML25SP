@@ -1,6 +1,6 @@
 """
 LLaMA Fine-Tuning with Memory Optimizations
-- Data processing from climate document PDFs
+- Uses preprocessed climate document text data
 - LoRA + Quantization + Gradient Accumulation & Checkpointing
 - Maximizing batch size on a single GPU
 """
@@ -11,8 +11,8 @@ import random
 import math
 import torch
 import numpy as np
+import json
 from tqdm import tqdm
-import PyPDF2
 import logging
 import time
 import psutil
@@ -30,23 +30,19 @@ from transformers import (
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 from datasets import Dataset
 
-# Parse command-line arguments
 def parse_args():
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Fine-tune LLaMA on climate documents with memory optimizations")
 
     # Paths
     parser.add_argument("--model_path", type=str, default="/root/bdml25sp/datasets/BDML25SP/Llama3.2-3B",
                         help="Path to the LLaMA 3B model")
-    parser.add_argument("--data_path", type=str, default="/root/bdml25sp/datasets/BDML25SP/climate_text_dataset",
-                        help="Path to the climate PDFs directory")
+    parser.add_argument("--data_dir", type=str, default="./processed_data",
+                        help="Directory containing preprocessed text data")
     parser.add_argument("--output_dir", type=str, default="./llama-finetuned",
                         help="Directory to save fine-tuned model and outputs")
-    parser.add_argument("--txt_dir", type=str, default="./extracted_texts",
-                        help="Directory to save extracted texts from PDFs")
 
     # Training parameters
-    parser.add_argument("--train_test_split", type=float, default=0.9,
-                        help="Ratio of train/test split (e.g., 0.9 for 90% training)")
     parser.add_argument("--learning_rate", type=float, default=2e-4,
                         help="Learning rate for training")
     parser.add_argument("--num_epochs", type=int, default=3,
@@ -115,18 +111,17 @@ def parse_args():
 
     return args
 
-# Set up logging
-def setup_logging():
+def setup_logging(log_file="training.log"):
+    """Set up logging configuration."""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler("training.log"),
+            logging.FileHandler(log_file),
             logging.StreamHandler()
         ]
     )
 
-# Function to monitor GPU usage
 def log_gpu_usage():
     """Log GPU memory usage."""
     try:
@@ -145,54 +140,36 @@ def log_gpu_usage():
     ram = psutil.virtual_memory()
     logging.info(f"RAM Usage: {ram.used/1e9:.1f}GB/{ram.total/1e9:.1f}GB ({ram.percent:.1f}%)")
 
-# Create directories if they don't exist
-def create_directories(txt_dir, output_dir):
+def create_directories(output_dir):
     """Create necessary directories."""
-    os.makedirs(txt_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
-    logging.info(f"Created directories: {txt_dir}, {output_dir}")
+    logging.info(f"Created directory: {output_dir}")
 
-# STEP 1: Data Processing - Extract text from PDFs
-def extract_text_from_pdfs(pdf_dir, output_dir):
-    """Extract text from all PDFs in the directory and save to txt files."""
-    pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
-    logging.info(f"Found {len(pdf_files)} PDF files")
+def load_preprocessed_data(data_dir):
+    """Load preprocessed data split info.
 
-    for pdf_path in tqdm(pdf_files, desc="Extracting text from PDFs"):
-        try:
-            filename = os.path.basename(pdf_path).replace('.pdf', '.txt')
-            output_path = os.path.join(output_dir, filename)
+    Args:
+        data_dir: Directory containing preprocessed data
 
-            # Skip if already processed
-            if os.path.exists(output_path):
-                continue
+    Returns:
+        tuple: (train_files, test_files)
+    """
+    # Load split info
+    split_info_path = os.path.join(data_dir, "split_info.json")
+    if not os.path.exists(split_info_path):
+        raise FileNotFoundError(f"Split info file not found at {split_info_path}. Run preprocess_data.py first.")
 
-            # Extract text using PyPDF2
-            with open(pdf_path, 'rb') as file:
-                reader = PyPDF2.PdfReader(file)
-                text = ""
-                for page_num in range(len(reader.pages)):
-                    text += reader.pages[page_num].extract_text() + "\n\n"
+    with open(split_info_path, 'r') as f:
+        split_info = json.load(f)
 
-            # Save the extracted text
-            with open(output_path, 'w', encoding='utf-8') as txt_file:
-                txt_file.write(text)
+    # Get full paths
+    train_files = [os.path.join(data_dir, filename) for filename in split_info["train_files"]]
+    test_files = [os.path.join(data_dir, filename) for filename in split_info["test_files"]]
 
-        except Exception as e:
-            logging.error(f"Error processing {pdf_path}: {e}")
+    logging.info(f"Loaded data split: {len(train_files)} training files, {len(test_files)} test files")
 
-    return glob.glob(os.path.join(output_dir, "*.txt"))
-
-# STEP 2: Split data into train and test sets
-def split_train_test(file_list, train_ratio=0.9):
-    """Split files into training and testing sets."""
-    random.shuffle(file_list)
-    split_idx = int(len(file_list) * train_ratio)
-    train_files = file_list[:split_idx]
-    test_files = file_list[split_idx:]
     return train_files, test_files
 
-# STEP 3: Create datasets for training and evaluation
 def create_dataset(file_paths, tokenizer, max_length=512):
     """Create dataset from text files."""
     texts = []
@@ -219,7 +196,6 @@ def tokenize_function(examples, tokenizer, max_length=512):
         return_special_tokens_mask=True
     )
 
-# STEP 4: Configure model with memory optimizations
 def configure_model_for_fine_tuning(
     model_path,
     load_in_4bit=True,
@@ -285,7 +261,6 @@ def configure_model_for_fine_tuning(
 
     return model, tokenizer
 
-# STEP 5: Configure training arguments
 def get_training_args(
     output_dir,
     batch_size,
@@ -328,7 +303,6 @@ def get_training_args(
 
     return training_args
 
-# STEP 6: Train the model
 def train_model(
     model,
     tokenizer,
@@ -341,7 +315,11 @@ def train_model(
     num_epochs=3,
     use_fp16=True,
     use_bf16=False,
-    use_8bit_optimizer=True
+    use_8bit_optimizer=True,
+    logging_steps=10,
+    eval_steps=100,
+    save_steps=500,
+    save_total_limit=1
 ):
     """Train the model with memory optimizations."""
     logging.info(f"Training with batch size: {batch_size}, grad accum: {gradient_accumulation_steps}")
@@ -361,7 +339,11 @@ def train_model(
         num_epochs=num_epochs,
         use_fp16=use_fp16,
         use_bf16=use_bf16,
-        use_8bit_optimizer=use_8bit_optimizer
+        use_8bit_optimizer=use_8bit_optimizer,
+        logging_steps=logging_steps,
+        eval_steps=eval_steps,
+        save_steps=save_steps,
+        save_total_limit=save_total_limit
     )
 
     # Initialize Trainer
@@ -380,7 +362,6 @@ def train_model(
     trainer.save_model(output_dir)
     return trainer
 
-# STEP 7: Evaluate the model using perplexity
 def evaluate_perplexity(model, tokenizer, test_dataset):
     """Evaluate the model using perplexity metric."""
     model.eval()
@@ -400,7 +381,6 @@ def evaluate_perplexity(model, tokenizer, test_dataset):
     logging.info(f"Perplexity: {perplexity:.2f}")
     return perplexity
 
-# STEP 8: Find maximum batch size through binary search
 def find_max_batch_size(
     model,
     tokenizer,
@@ -410,7 +390,11 @@ def find_max_batch_size(
     start_batch_size=1,
     max_batch_size=128,
     safe_batch_size=8,
-    base_grad_accum=32
+    base_grad_accum=32,
+    learning_rate=2e-4,
+    use_fp16=True,
+    use_bf16=False,
+    use_8bit_optimizer=True
 ):
     """Binary search to find maximum batch size."""
     min_batch = start_batch_size
@@ -427,7 +411,11 @@ def find_max_batch_size(
         training_args = get_training_args(
             output_dir=output_dir,
             batch_size=safe_batch_size,
-            gradient_accumulation_steps=grad_accum_steps
+            gradient_accumulation_steps=grad_accum_steps,
+            learning_rate=learning_rate,
+            use_fp16=use_fp16,
+            use_bf16=use_bf16,
+            use_8bit_optimizer=use_8bit_optimizer
         )
         trainer = Trainer(
             model=model,
@@ -473,7 +461,11 @@ def find_max_batch_size(
             training_args = get_training_args(
                 output_dir=output_dir,
                 batch_size=mid_batch,
-                gradient_accumulation_steps=grad_accum_steps
+                gradient_accumulation_steps=grad_accum_steps,
+                learning_rate=learning_rate,
+                use_fp16=use_fp16,
+                use_bf16=use_bf16,
+                use_8bit_optimizer=use_8bit_optimizer
             )
             trainer = Trainer(
                 model=model,
@@ -537,23 +529,18 @@ def main(args):
         torch.cuda.manual_seed_all(args.seed)
 
     try:
-        # Create necessary directories
-        create_directories(args.txt_dir, args.output_dir)
+        # Create output directory
+        create_directories(args.output_dir)
 
         # Log initial GPU usage
         log_gpu_usage()
 
-        # Extract text from PDFs
-        logging.info("Step 1: Extracting text from PDFs...")
-        txt_files = extract_text_from_pdfs(args.data_path, args.txt_dir)
-
-        # Split data
-        logging.info("Step 2: Splitting into train and test sets...")
-        train_files, test_files = split_train_test(txt_files, args.train_test_split)
-        logging.info(f"Training on {len(train_files)} files, testing on {len(test_files)} files")
+        # Load preprocessed data
+        logging.info("Loading preprocessed data...")
+        train_files, test_files = load_preprocessed_data(args.data_dir)
 
         # Initialize model and tokenizer with memory optimizations
-        logging.info("Step 3: Configuring model with memory optimizations...")
+        logging.info("Configuring model with memory optimizations...")
         model, tokenizer = configure_model_for_fine_tuning(
             model_path=args.model_path,
             load_in_4bit=args.load_in_4bit,
@@ -568,14 +555,14 @@ def main(args):
         log_gpu_usage()
 
         # Create datasets
-        logging.info("Step 4: Creating datasets...")
+        logging.info("Creating datasets...")
         train_dataset = create_dataset(train_files, tokenizer, max_length=args.max_length)
         eval_dataset = create_dataset(test_files, tokenizer, max_length=args.max_length)
         logging.info(f"Train dataset size: {len(train_dataset)} samples")
         logging.info(f"Eval dataset size: {len(eval_dataset)} samples")
 
         # Find maximum batch size
-        logging.info("Step 5: Finding maximum batch size...")
+        logging.info("Finding maximum batch size...")
         max_batch_size = find_max_batch_size(
             model=model,
             tokenizer=tokenizer,
@@ -585,12 +572,16 @@ def main(args):
             start_batch_size=args.start_batch_size,
             max_batch_size=args.max_batch_size,
             safe_batch_size=args.safe_batch_size,
-            base_grad_accum=args.base_grad_accum
+            base_grad_accum=args.base_grad_accum,
+            learning_rate=args.learning_rate,
+            use_fp16=args.use_fp16,
+            use_bf16=args.use_bf16,
+            use_8bit_optimizer=args.use_8bit_optimizer
         )
         log_gpu_usage()
 
         # Train the model with the optimal batch size
-        logging.info(f"Step 6: Training model with batch size {max_batch_size}...")
+        logging.info(f"Training model with batch size {max_batch_size}...")
         grad_accum_steps = max(1, args.base_grad_accum // max_batch_size)  # Ensure at least 1
         trainer = train_model(
             model=model,
@@ -604,12 +595,16 @@ def main(args):
             num_epochs=args.num_epochs,
             use_fp16=args.use_fp16,
             use_bf16=args.use_bf16,
-            use_8bit_optimizer=args.use_8bit_optimizer
+            use_8bit_optimizer=args.use_8bit_optimizer,
+            logging_steps=args.logging_steps,
+            eval_steps=args.eval_steps,
+            save_steps=args.save_steps,
+            save_total_limit=args.save_total_limit
         )
         log_gpu_usage()
 
         # Evaluate the model
-        logging.info("Step 7: Evaluating model...")
+        logging.info("Evaluating model...")
         perplexity = evaluate_perplexity(model, tokenizer, eval_dataset)
 
         # Calculate elapsed time
