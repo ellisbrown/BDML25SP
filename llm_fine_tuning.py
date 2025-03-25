@@ -458,6 +458,14 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
     """Train the model with memory optimizations."""
     print(f"Training with batch size: {batch_size}, grad accum: {gradient_accumulation_steps}")
 
+    # Limit evaluation samples to save time
+    max_eval_samples = 128
+    if len(eval_dataset) > max_eval_samples:
+        logging.info(f"Limiting evaluation samples to {max_eval_samples} during training (actual: {len(eval_dataset)})")
+        eval_dataset = eval_dataset.select(range(max_eval_samples))
+        # # random sample
+        # eval_dataset = eval_dataset.select(random.sample(range(len(eval_dataset)), max_eval_samples))
+
     # Log to wandb
     use_wandb = args.use_wandb and wandb.run is not None
     if use_wandb:

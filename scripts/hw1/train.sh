@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # Script to run LLaMA fine-tuning with memory optimizations
 # Usage: ./run_training.sh
@@ -44,7 +45,7 @@ python llm_fine_tuning.py \
     --use_8bit_optimizer \
     --use_double_quant \
     --logging_steps 1 \
-    --eval_steps 10 \
+    --eval_steps 20 \
     --save_steps 500 \
     --save_total_limit 1 \
     --device "cuda:0" \
