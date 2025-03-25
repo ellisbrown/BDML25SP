@@ -17,6 +17,7 @@ import logging
 import time
 import psutil
 import GPUtil
+import argparse
 from datetime import datetime
 from transformers import (
     AutoModelForCausalLM,
@@ -29,12 +30,93 @@ from transformers import (
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 from datasets import Dataset
 
-# Constants
-MODEL_PATH = "/root/bdml25sp/datasets/BDML25SP/Llama3.2-3B"  # Path to LLaMA 3B model
-DATA_PATH = "/root/bdml25sp/datasets/BDML25SP/climate_text_dataset"   # Path to climate PDFs
-OUTPUT_DIR = "./llama-finetuned"
-TXT_DIR = "./extracted_texts"
-TRAIN_TEST_SPLIT = 0.9  # 90% for training, 10% for testing
+# Parse command-line arguments
+def parse_args():
+    parser = argparse.ArgumentParser(description="Fine-tune LLaMA on climate documents with memory optimizations")
+
+    # Paths
+    parser.add_argument("--model_path", type=str, default="/root/bdml25sp/datasets/BDML25SP/Llama3.2-3B",
+                        help="Path to the LLaMA 3B model")
+    parser.add_argument("--data_path", type=str, default="/root/bdml25sp/datasets/BDML25SP/climate_text_dataset",
+                        help="Path to the climate PDFs directory")
+    parser.add_argument("--output_dir", type=str, default="./llama-finetuned",
+                        help="Directory to save fine-tuned model and outputs")
+    parser.add_argument("--txt_dir", type=str, default="./extracted_texts",
+                        help="Directory to save extracted texts from PDFs")
+
+    # Training parameters
+    parser.add_argument("--train_test_split", type=float, default=0.9,
+                        help="Ratio of train/test split (e.g., 0.9 for 90% training)")
+    parser.add_argument("--learning_rate", type=float, default=2e-4,
+                        help="Learning rate for training")
+    parser.add_argument("--num_epochs", type=int, default=3,
+                        help="Number of training epochs")
+    parser.add_argument("--max_length", type=int, default=512,
+                        help="Maximum sequence length for tokenization")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility")
+
+    # Memory optimization parameters
+    parser.add_argument("--start_batch_size", type=int, default=1,
+                        help="Minimum batch size to try")
+    parser.add_argument("--max_batch_size", type=int, default=128,
+                        help="Maximum batch size to try")
+    parser.add_argument("--safe_batch_size", type=int, default=8,
+                        help="Safe batch size to try first")
+    parser.add_argument("--base_grad_accum", type=int, default=32,
+                        help="Base number for gradient accumulation steps")
+
+    # LoRA parameters
+    parser.add_argument("--lora_r", type=int, default=8,
+                        help="LoRA rank dimension")
+    parser.add_argument("--lora_alpha", type=int, default=32,
+                        help="LoRA alpha (scaling factor)")
+    parser.add_argument("--lora_dropout", type=float, default=0.1,
+                        help="LoRA dropout rate")
+    parser.add_argument("--lora_target_modules", type=str, default="q_proj,k_proj,v_proj,o_proj",
+                        help="Comma-separated list of modules to apply LoRA to")
+
+    # Quantization and precision options
+    parser.add_argument("--load_in_4bit", action="store_true", default=True,
+                        help="Load model in 4-bit precision")
+    parser.add_argument("--load_in_8bit", action="store_true", default=False,
+                        help="Load model in 8-bit precision")
+    parser.add_argument("--use_fp16", action="store_true", default=True,
+                        help="Use mixed precision training (FP16)")
+    parser.add_argument("--use_bf16", action="store_true", default=False,
+                        help="Use mixed precision training (BF16)")
+
+    # Optimization flags
+    parser.add_argument("--use_gradient_checkpointing", action="store_true", default=True,
+                        help="Enable gradient checkpointing")
+    parser.add_argument("--use_8bit_optimizer", action="store_true", default=True,
+                        help="Use 8-bit optimizer (paged_adamw_8bit)")
+    parser.add_argument("--use_double_quant", action="store_true", default=True,
+                        help="Use double quantization for 4-bit training")
+
+    # Logging and evaluation
+    parser.add_argument("--logging_steps", type=int, default=10,
+                        help="Logging frequency during training (steps)")
+    parser.add_argument("--eval_steps", type=int, default=100,
+                        help="Evaluation frequency during training (steps)")
+    parser.add_argument("--save_steps", type=int, default=500,
+                        help="Model saving frequency during training (steps)")
+    parser.add_argument("--save_total_limit", type=int, default=1,
+                        help="Maximum number of checkpoints to keep")
+
+    # Devices
+    parser.add_argument("--device", type=str, default="cuda:0",
+                        help="Device to use for training (e.g., cuda:0)")
+
+    args = parser.parse_args()
+
+    # Convert comma-separated target modules to list
+    args.lora_target_modules = args.lora_target_modules.split(",")
+
+    return args
+
+# Set up global args
+args = parse_args()
 
 # Set up logging
 logging.basicConfig(
@@ -45,10 +127,6 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
-# Create directory for extracted texts if it doesn't exist
-os.makedirs(TXT_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Function to monitor GPU usage
 def log_gpu_usage():
@@ -69,11 +147,18 @@ def log_gpu_usage():
     ram = psutil.virtual_memory()
     logging.info(f"RAM Usage: {ram.used/1e9:.1f}GB/{ram.total/1e9:.1f}GB ({ram.percent:.1f}%)")
 
+# Create directories if they don't exist
+def create_directories():
+    """Create necessary directories."""
+    os.makedirs(args.txt_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
+    logging.info(f"Created directories: {args.txt_dir}, {args.output_dir}")
+
 # STEP 1: Data Processing - Extract text from PDFs
 def extract_text_from_pdfs(pdf_dir, output_dir):
     """Extract text from all PDFs in the directory and save to txt files."""
     pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
-    print(f"Found {len(pdf_files)} PDF files")
+    logging.info(f"Found {len(pdf_files)} PDF files")
 
     for pdf_path in tqdm(pdf_files, desc="Extracting text from PDFs"):
         try:
@@ -96,7 +181,7 @@ def extract_text_from_pdfs(pdf_dir, output_dir):
                 txt_file.write(text)
 
         except Exception as e:
-            print(f"Error processing {pdf_path}: {e}")
+            logging.error(f"Error processing {pdf_path}: {e}")
 
     return glob.glob(os.path.join(output_dir, "*.txt"))
 
@@ -110,7 +195,7 @@ def split_train_test(file_list, train_ratio=0.9):
     return train_files, test_files
 
 # STEP 3: Create datasets for training and evaluation
-def create_dataset(file_paths, tokenizer, max_length=512):
+def create_dataset(file_paths, tokenizer):
     """Create dataset from text files."""
     texts = []
 
@@ -119,20 +204,20 @@ def create_dataset(file_paths, tokenizer, max_length=512):
             text = f.read()
             # Split text into chunks of max_length tokens
             tokens = tokenizer.encode(text)
-            for i in range(0, len(tokens), max_length):
-                chunk = tokens[i:i + max_length]
+            for i in range(0, len(tokens), args.max_length):
+                chunk = tokens[i:i + args.max_length]
                 if len(chunk) > 100:  # Skip very short chunks
                     texts.append(tokenizer.decode(chunk))
 
     return Dataset.from_dict({"text": texts})
 
-def tokenize_function(examples, tokenizer, max_length=512):
+def tokenize_function(examples, tokenizer):
     """Tokenize the text examples."""
     return tokenizer(
         examples["text"],
         padding="max_length",
         truncation=True,
-        max_length=max_length,
+        max_length=args.max_length,
         return_special_tokens_mask=True
     )
 
@@ -141,37 +226,45 @@ def configure_model_for_fine_tuning():
     """Configure LLaMA model with memory optimizations."""
 
     # Configure quantization
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4"
-    )
+    quantization_config = None
+    if args.load_in_4bit:
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=args.use_double_quant,
+            bnb_4bit_quant_type="nf4"
+        )
+    elif args.load_in_8bit:
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True
+        )
 
     # Load the model with quantization
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
+        args.model_path,
         quantization_config=quantization_config,
         device_map="auto",
         trust_remote_code=True
     )
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     tokenizer.pad_token = tokenizer.eos_token
 
     # Prepare model for k-bit training
     model = prepare_model_for_kbit_training(model)
 
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
+    # Enable gradient checkpointing if requested
+    if args.use_gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        logging.info("Gradient checkpointing enabled")
 
     # Configure LoRA
     lora_config = LoraConfig(
-        r=8,                     # Rank dimension
-        lora_alpha=32,           # Scaling factor
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # Apply to attention layers
-        lora_dropout=0.1,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=args.lora_target_modules,
+        lora_dropout=args.lora_dropout,
         bias="none",
         task_type=TaskType.CAUSAL_LM
     )
