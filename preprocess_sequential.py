@@ -1,8 +1,8 @@
 """
-Ultra-simple and reliable preprocessing script for climate data
-- Processes PDFs sequentially to avoid multiprocessing issues
-- Uses strict timeouts to handle problematic files
-- Saves progress continuously so it can be stopped and resumed
+Ultra-simple preprocessing script based on working example
+- Uses bare minimum approach that's proven to work
+- No complex error handling or multiprocessing
+- Just extracts text and saves files
 """
 
 import os
@@ -10,102 +10,59 @@ import glob
 import random
 import argparse
 import json
-import signal
 import logging
-import time
 from datetime import datetime
 from tqdm import tqdm
+from PyPDF2 import PdfReader
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("preprocess_sequential.log"),
+        logging.FileHandler("preprocessing.log"),
         logging.StreamHandler()
     ]
 )
 
-# Set a timeout for PDF processing
-def timeout_handler(signum, frame):
-    raise TimeoutError("PDF processing timed out")
-
-def extract_text_with_timeout(pdf_path, timeout=30):
-    """Extract text from a PDF with a strict timeout"""
-    # Set the timeout handler
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(timeout)  # Set alarm for N seconds
-
-    try:
-        # Import PyPDF2 here to avoid any module-level issues
-        import PyPDF2
-
-        with open(pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            text = ""
-            # Limit pages to avoid extremely large files
-            max_pages = min(len(reader.pages), 300)
-
-            for page_num in range(max_pages):
-                try:
-                    page_text = reader.pages[page_num].extract_text()
-                    if page_text:
-                        text += page_text + "\n\n"
-                except Exception as e:
-                    # Skip problematic pages quietly
-                    continue
-
-        # Cancel the alarm
-        signal.alarm(0)
-        return text
-    except TimeoutError:
-        logging.warning(f"Processing timed out for {pdf_path}")
-        return ""
-    except Exception as e:
-        logging.warning(f"Error processing {pdf_path}: {str(e)}")
-        return ""
-    finally:
-        # Ensure alarm is canceled even if an exception occurs
-        signal.alarm(0)
-
-def process_pdfs(pdf_dir, output_dir, min_chars=500, timeout=30, progress_file="preprocessing_progress.json"):
-    """Process PDFs sequentially with timeouts"""
+def process_pdfs(pdf_dir, output_dir, page_limit=30, min_chars=500):
+    """Process PDFs using the proven successful approach"""
     os.makedirs(output_dir, exist_ok=True)
 
     # Get all PDF files
     pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
     logging.info(f"Found {len(pdf_files)} PDF files to process")
 
-    # Load progress if exists
-    processed_files = set()
-    if os.path.exists(progress_file):
-        try:
-            with open(progress_file, 'r') as f:
-                progress_data = json.load(f)
-                processed_files = set(progress_data.get("processed_files", []))
-                logging.info(f"Loaded progress: {len(processed_files)} files already processed")
-        except Exception as e:
-            logging.warning(f"Error loading progress file: {e}")
-
-    # Filter out already processed files
-    pdf_files_to_process = [pdf for pdf in pdf_files if pdf not in processed_files]
-    logging.info(f"Remaining files to process: {len(pdf_files_to_process)}")
+    # Track successfully processed files
+    successful_files = []
 
     # Process files sequentially with progress bar
-    successful_files = []
-    for pdf_path in tqdm(pdf_files_to_process, desc="Processing PDFs"):
+    for pdf_path in tqdm(pdf_files, desc="Processing PDFs"):
         try:
             # Get output path
             filename = os.path.basename(pdf_path).replace('.pdf', '.txt')
             output_path = os.path.join(output_dir, filename)
 
-            # Skip if already processed (double-check)
+            # Skip if already processed
             if os.path.exists(output_path):
-                processed_files.add(pdf_path)
+                successful_files.append(output_path)
                 continue
 
-            # Extract text with timeout
-            text = extract_text_with_timeout(pdf_path, timeout)
+            # Open PDF - following the approach from your friend's code
+            reader = PdfReader(pdf_path)
+            text = ""
+
+            # Extract text from each page (up to page_limit)
+            for page_num, page in enumerate(reader.pages):
+                if page_num >= page_limit:
+                    break
+                try:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n\n"
+                except Exception as e:
+                    # Just log and continue to next page
+                    logging.warning(f"Error on page {page_num} of {pdf_path}: {str(e)}")
 
             # Check if extraction was successful
             if text and len(text) >= min_chars:
@@ -113,25 +70,15 @@ def process_pdfs(pdf_dir, output_dir, min_chars=500, timeout=30, progress_file="
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(text)
                 successful_files.append(output_path)
-
-            # Mark file as processed regardless of success
-            processed_files.add(pdf_path)
-
-            # Save progress every 10 files
-            if len(processed_files) % 10 == 0:
-                with open(progress_file, 'w') as f:
-                    json.dump({"processed_files": list(processed_files)}, f)
+                logging.info(f"Successfully processed {pdf_path}")
+            else:
+                logging.warning(f"Extracted text too short for {pdf_path}")
 
         except Exception as e:
-            logging.error(f"Error processing {pdf_path}: {e}")
+            logging.error(f"Error processing {pdf_path}: {str(e)}")
 
     # Get all successfully extracted text files
     all_txt_files = glob.glob(os.path.join(output_dir, "*.txt"))
-
-    # Final progress save
-    with open(progress_file, 'w') as f:
-        json.dump({"processed_files": list(processed_files)}, f)
-
     logging.info(f"Successfully processed {len(all_txt_files)} files")
     return all_txt_files
 
@@ -162,15 +109,15 @@ def save_split_info(train_files, test_files, output_dir):
 
 def parse_args():
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Simple preprocessing of PDF data")
+    parser = argparse.ArgumentParser(description="Ultra-simple preprocessing of PDF data")
     parser.add_argument("--pdf_dir", type=str, default="/root/bdml25sp/datasets/BDML25SP/climate_text_dataset",
                         help="Directory containing PDF files")
     parser.add_argument("--output_dir", type=str, default="./processed_data",
                         help="Directory to save processed text")
+    parser.add_argument("--page_limit", type=int, default=30,
+                        help="Maximum number of pages to process per PDF")
     parser.add_argument("--min_chars", type=int, default=500,
                         help="Minimum characters for valid extraction")
-    parser.add_argument("--timeout", type=int, default=30,
-                        help="Timeout in seconds for processing each PDF")
     parser.add_argument("--train_ratio", type=float, default=0.9,
                         help="Ratio for train/test split")
     parser.add_argument("--seed", type=int, default=42,
@@ -183,12 +130,12 @@ def main():
     start_time = datetime.now()
     logging.info(f"Starting preprocessing at {start_time}")
 
-    # Process PDFs sequentially with timeouts
+    # Process PDFs sequentially
     txt_files = process_pdfs(
         pdf_dir=args.pdf_dir,
         output_dir=args.output_dir,
-        min_chars=args.min_chars,
-        timeout=args.timeout
+        page_limit=args.page_limit,
+        min_chars=args.min_chars
     )
 
     if not txt_files:
