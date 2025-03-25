@@ -362,7 +362,8 @@ def configure_model_for_fine_tuning():
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=args.use_double_quant,
-            bnb_4bit_quant_type="nf4"
+            bnb_4bit_quant_type="nf4",
+            llm_int8_enable_fp32_cpu_offload=True  # Add this for CPU offloading
         )
     elif args.load_in_8bit:
         quantization_config = BitsAndBytesConfig(
@@ -484,7 +485,7 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
     print(f"Training with batch size: {batch_size}, grad accum: {gradient_accumulation_steps}")
 
     # Limit evaluation samples to save time
-    max_eval_samples = 128
+    max_eval_samples = 256
     if len(eval_dataset) > max_eval_samples:
         logging.info(f"Limiting evaluation samples to {max_eval_samples} during training (actual: {len(eval_dataset)})")
         eval_dataset = eval_dataset.select(range(max_eval_samples))

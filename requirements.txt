@@ -11,3 +11,4 @@ sentencepiece
 blobfile
 wandb
 # flash-attn  # Requires manual installation with: pip install flash-attn --no-build-isolation
+deepspeed

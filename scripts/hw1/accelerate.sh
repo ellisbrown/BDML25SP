@@ -1,15 +1,12 @@
 #!/bin/bash
 set -e
 
-# Script to run LLaMA fine-tuning with memory optimizations
-# Usage: ./run_training.sh
-
-echo "Starting LLaMA fine-tuning with memory optimizations..."
+echo "Starting LLaMA fine-tuning with Accelerate..."
 
 # Configure paths
-MODEL_PATH="/root/bdml25sp/datasets/BDML25SP/Llama3.2-3B-converted"  # Path to the converted model
+MODEL_PATH="/root/bdml25sp/datasets/BDML25SP/Llama3.2-3B-converted"
 DATA_DIR="./processed_data"
-OUTPUT_DIR="./checkpoints/llama-finetuned"
+OUTPUT_DIR="./checkpoints/llama-finetuned-accelerate"
 LOGS_DIR="./logs"
 
 # Create directories
@@ -17,13 +14,15 @@ mkdir -p "$OUTPUT_DIR"
 mkdir -p "$LOGS_DIR"
 
 # Set GPU device
-export CUDA_VISIBLE_DEVICES=0
+GPU_IDS=1
+export CUDA_VISIBLE_DEVICES=$GPU_IDS
 
-# Create output directory
-mkdir -p "$OUTPUT_DIR"
-
-# Run the fine-tuning script
-python llm_fine_tuning.py \
+# First run 'accelerate config' once to set up configuration
+# Then run with accelerate launch
+accelerate launch \
+    --config_file accelerate_config.yaml \
+    --gpu_ids $GPU_IDS \
+    llm_fine_tuning.py \
     --model_path "$MODEL_PATH" \
     --data_dir "$DATA_DIR" \
     --output_dir "$OUTPUT_DIR" \
@@ -53,6 +52,6 @@ python llm_fine_tuning.py \
     --use_wandb \
     --wandb_project "bdml25sp" \
     --wandb_entity "ellisbrown" \
-    --wandb_run_name "hw1_finetuning"
+    --wandb_run_name hw1_finetuning_accelerate
 
 echo "Fine-tuning complete! See $OUTPUT_DIR/training_stats.txt for results."
