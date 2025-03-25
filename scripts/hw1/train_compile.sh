@@ -17,7 +17,7 @@ mkdir -p "$OUTPUT_DIR"
 mkdir -p "$LOGS_DIR"
 
 # Set GPU device
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -43,10 +43,9 @@ python llm_fine_tuning.py \
     --use_bf16 \
     --use_gradient_checkpointing \
     --use_8bit_optimizer \
-    --use_double_quant \
-    --flash_attention \
-    --logging_steps 10 \
-    --eval_steps 50 \
+    --compile_model \
+    --logging_steps 1 \
+    --eval_steps 20 \
     --save_steps 500 \
     --save_total_limit 1 \
     --device "cuda:0" \

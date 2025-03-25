@@ -62,6 +62,12 @@ def parse_args():
                         help="Safe batch size to try first")
     parser.add_argument("--base_grad_accum", type=int, default=32,
                         help="Base number for gradient accumulation steps")
+    # flash attention:
+    parser.add_argument("--flash_attention", action="store_true", default=True,
+                        help="Use Flash Attention for training")
+    parser.add_argument("--sdpa_attention", action="store_true", default=True,
+                        help="Use SDPA Attention for training")
+
 
     # LoRA parameters
     parser.add_argument("--lora_r", type=int, default=8,
@@ -82,6 +88,8 @@ def parse_args():
                         help="Use mixed precision training (FP16)")
     parser.add_argument("--use_bf16", action="store_true", default=False,
                         help="Use mixed precision training (BF16)")
+    parser.add_argument("--compile_model", action="store_true", default=False,
+                        help="Compile model with torch.compile()")
 
     # Optimization flags
     parser.add_argument("--use_gradient_checkpointing", action="store_true", default=True,
@@ -362,11 +370,23 @@ def configure_model_for_fine_tuning():
         )
 
     # Load the model with quantization
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+    model_kwargs = dict(
         quantization_config=quantization_config,
         device_map="auto",
-        trust_remote_code=True
+        trust_remote_code=True,
+    )
+    if args.flash_attention:
+        model_kwargs.update(dict(
+            attn_implementation="flash_attention_2"
+        ))
+    elif args.sdpa_attention:
+        model_kwargs.update(dict(
+            attn_implementation="sdpa"
+        ))
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        **model_kwargs
     )
 
     # Load tokenizer
@@ -394,6 +414,11 @@ def configure_model_for_fine_tuning():
     # Apply LoRA to the model
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+
+    # Add after configuring model with LoRA in configure_model_for_fine_tuning()
+    if torch.cuda.is_available() and hasattr(torch, 'compile') and args.compile_model:
+        model = torch.compile(model, mode="reduce-overhead")
+        logging.info("Model compiled with torch.compile()")
 
     return model, tokenizer
 
