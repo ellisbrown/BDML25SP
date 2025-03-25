@@ -6,3 +6,6 @@ peft
 PyPDF2
 psutil
 gputil
+tiktoken
+sentencepiece
+blobfile

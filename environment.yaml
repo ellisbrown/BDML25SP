@@ -8,6 +8,8 @@ dependencies:
   - libaio
   - gxx_linux-64=11.3
   - openjdk=8
+  - pkg-config
+  - cmake
   - pip:
     - pandas
     - matplotlib
