@@ -1,6 +1,7 @@
 bash/
 datasets
 datasets/
+extracted_texts/
 
 # Created by https://www.toptal.com/developers/gitignore/api/data,linux,macos,python,jupyternotebooks
 # Edit at https://www.toptal.com/developers/gitignore?templates=data,linux,macos,python,jupyternotebooks

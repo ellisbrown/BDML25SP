@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # Set default values for your environment
 MODEL_PATH="/root/bdml25sp/datasets/BDML25SP/Llama3.2-3B"
@@ -7,17 +8,17 @@ OUTPUT_DIR="./llama-finetuned"
 TXT_DIR="./extracted_texts"
 DEVICE="cuda:0"
 
-# Create virtual environment if it doesn't exist
-if [ ! -d "llm_env" ]; then
-    echo "Creating new virtual environment..."
-    python -m venv llm_env
-fi
+# # Create virtual environment if it doesn't exist
+# if [ ! -d "llm_env" ]; then
+#     echo "Creating new virtual environment..."
+#     python -m venv llm_env
+# fi
 
-# Activate virtual environment
-source llm_env/bin/activate
+# # Activate virtual environment
+# source llm_env/bin/activate
 
-# Install required packages
-pip install torch==2.0.1 transformers==4.31.0 datasets==2.13.1 peft==0.4.0 tqdm bitsandbytes==0.40.2 accelerate==0.21.0 PyPDF2 psutil gputil
+# # Install required packages
+# pip install torch==2.0.1 transformers==4.31.0 datasets==2.13.1 peft==0.4.0 tqdm bitsandbytes==0.40.2 accelerate==0.21.0 PyPDF2 psutil gputil
 
 # Extract dataset if needed
 if [ ! -d "$DATA_PATH" ] || [ -z "$(ls -A $DATA_PATH)" ]; then

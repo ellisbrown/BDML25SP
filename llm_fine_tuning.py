@@ -450,17 +450,32 @@ def main():
         logging.info(f"CUDA device count: {torch.cuda.device_count()}")
         logging.info(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
+    # Log all arguments
+    logging.info("Arguments:")
+    for arg in vars(args):
+        logging.info(f"  {arg}: {getattr(args, arg)}")
+
+    # Set random seed for reproducibility
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     try:
+        # Create necessary directories
+        create_directories()
+
         # Log initial GPU usage
         log_gpu_usage()
 
         # Extract text from PDFs
         logging.info("Step 1: Extracting text from PDFs...")
-        txt_files = extract_text_from_pdfs(DATA_PATH, TXT_DIR)
+        txt_files = extract_text_from_pdfs(args.data_path, args.txt_dir)
 
         # Split data
         logging.info("Step 2: Splitting into train and test sets...")
-        train_files, test_files = split_train_test(txt_files, TRAIN_TEST_SPLIT)
+        train_files, test_files = split_train_test(txt_files, args.train_test_split)
         logging.info(f"Training on {len(train_files)} files, testing on {len(test_files)} files")
 
         # Initialize model and tokenizer with memory optimizations
@@ -482,7 +497,7 @@ def main():
 
         # Train the model with the optimal batch size
         logging.info(f"Step 6: Training model with batch size {max_batch_size}...")
-        grad_accum_steps = max(1, 32 // max_batch_size)  # Ensure at least 1
+        grad_accum_steps = max(1, args.base_grad_accum // max_batch_size)  # Ensure at least 1
         trainer = train_model(model, tokenizer, train_dataset, eval_dataset, max_batch_size, grad_accum_steps)
         log_gpu_usage()
 
@@ -502,13 +517,17 @@ def main():
         logging.info(f"Final perplexity: {perplexity:.2f}")
 
         # Save training stats
-        with open(os.path.join(OUTPUT_DIR, "training_stats.txt"), "w") as f:
+        with open(os.path.join(args.output_dir, "training_stats.txt"), "w") as f:
             f.write(f"Training completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Maximum batch size: {max_batch_size}\n")
             f.write(f"Gradient accumulation steps: {grad_accum_steps}\n")
             f.write(f"Effective batch size: {max_batch_size * grad_accum_steps}\n")
             f.write(f"Final perplexity: {perplexity:.2f}\n")
             f.write(f"Total training time: {int(hours)}h {int(minutes)}m {int(seconds)}s\n")
+            # Save all arguments
+            f.write("\nArguments:\n")
+            for arg in vars(args):
+                f.write(f"  {arg}: {getattr(args, arg)}\n")
 
         return max_batch_size, grad_accum_steps, perplexity
 
