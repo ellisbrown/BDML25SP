@@ -9,3 +9,4 @@ gputil
 tiktoken
 sentencepiece
 blobfile
+wandb

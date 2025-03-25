@@ -11,7 +11,7 @@ DATA_DIR="./processed_data"
 OUTPUT_DIR="./llama-finetuned"
 
 # Set GPU device
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -42,6 +42,10 @@ python llm_fine_tuning.py \
     --eval_steps 100 \
     --save_steps 500 \
     --save_total_limit 1 \
-    --device "cuda:0"
+    --device "cuda:0" \
+    --use_wandb \
+    --wandb_project "bdml25sp" \
+    --wandb_entity "ellisbrown" \
+    --wandb_run_name "hw1_finetuning"
 
 echo "Fine-tuning complete! See $OUTPUT_DIR/training_stats.txt for results."

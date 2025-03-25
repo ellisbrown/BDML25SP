@@ -1,10 +1,3 @@
-"""
-LLaMA Fine-Tuning with Memory Optimizations
-- Data processing from climate document PDFs
-- LoRA + Quantization + Gradient Accumulation & Checkpointing
-- Maximizing batch size on a single GPU
-"""
-
 import os
 import glob
 import json
@@ -20,6 +13,7 @@ import psutil
 import GPUtil
 import argparse
 import hashlib
+import wandb
 from datetime import datetime
 from transformers import (
     AutoModelForCausalLM,
@@ -29,6 +23,7 @@ from transformers import (
     DataCollatorForLanguageModeling,
     BitsAndBytesConfig
 )
+from transformers.trainer_callback import TrainerCallback
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 from datasets import Dataset, load_from_disk
 
@@ -106,6 +101,18 @@ def parse_args():
     parser.add_argument("--save_total_limit", type=int, default=1,
                         help="Maximum number of checkpoints to keep")
 
+    # Weights & Biases arguments
+    parser.add_argument("--use_wandb", action="store_true", default=False,
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="llama-finetuning",
+                        help="Weights & Biases project name")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="Weights & Biases entity/username")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="Custom name for this run in W&B")
+    parser.add_argument("--wandb_tags", type=str, default="",
+                        help="Comma-separated list of tags for W&B run")
+
     # Devices
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Device to use for training (e.g., cuda:0)")
@@ -120,25 +127,31 @@ def parse_args():
 # Set up global args
 args = parse_args()
 
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("training.log"),
+        # logging.FileHandler("training.log"),
+        logging.FileHandler(f"logs/training_{timestamp}.log"),
         logging.StreamHandler()
     ]
 )
 
 # Function to monitor GPU usage
-def log_gpu_usage():
+def log_gpu_usage(log_to_wandb=False):
     """Log GPU memory usage."""
+    gpu_metrics = {}
     try:
         gpus = GPUtil.getGPUs()
         gpu_info = []
         for gpu in gpus:
             if int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")) == gpu.id:
                 gpu_info.append(f"GPU {gpu.id}: {gpu.memoryUsed}MB/{gpu.memoryTotal}MB ({gpu.memoryUtil*100:.1f}%)")
+                # Add GPU metrics to dict for wandb
+                gpu_metrics[f"gpu_{gpu.id}_memory_used_mb"] = gpu.memoryUsed
+                gpu_metrics[f"gpu_{gpu.id}_memory_util_pct"] = gpu.memoryUtil * 100
 
         if gpu_info:
             logging.info("GPU Memory Usage: " + ", ".join(gpu_info))
@@ -147,7 +160,19 @@ def log_gpu_usage():
 
     # Log RAM usage
     ram = psutil.virtual_memory()
-    logging.info(f"RAM Usage: {ram.used/1e9:.1f}GB/{ram.total/1e9:.1f}GB ({ram.percent:.1f}%)")
+    ram_used_gb = ram.used / 1e9
+    ram_total_gb = ram.total / 1e9
+    ram_percent = ram.percent
+
+    logging.info(f"RAM Usage: {ram_used_gb:.1f}GB/{ram_total_gb:.1f}GB ({ram_percent:.1f}%)")
+
+    # Add RAM metrics to dict for wandb
+    gpu_metrics["ram_used_gb"] = ram_used_gb
+    gpu_metrics["ram_util_pct"] = ram_percent
+
+    # Log to wandb if enabled
+    if log_to_wandb and args.use_wandb and wandb.run is not None:
+        wandb.log(gpu_metrics)
 
 # Create directories if they don't exist
 def create_directories(data_dir, output_dir, cache_dir):
@@ -212,7 +237,7 @@ def hash_file_paths(file_paths):
     return hash_obj.hexdigest()
 
 # Create raw text dataset with caching
-def create_text_dataset(file_paths, cache_dir, max_length=512):
+def create_text_dataset(file_paths, cache_dir):
     """Create dataset of raw texts from files with caching."""
     # Create a hash of the file paths to use as cache key
     files_hash = hash_file_paths(file_paths)
@@ -236,7 +261,7 @@ def create_text_dataset(file_paths, cache_dir, max_length=512):
 
                 for para in paragraphs:
                     # If adding this paragraph would make the chunk too long, save current chunk and start a new one
-                    if len(current_chunk) + len(para) > max_length * 4:  # Rough character estimate
+                    if len(current_chunk) + len(para) > args.max_length * 4:  # Rough character estimate
                         if current_chunk:
                             texts.append(current_chunk)
                         current_chunk = para
@@ -259,7 +284,7 @@ def create_text_dataset(file_paths, cache_dir, max_length=512):
     return dataset
 
 # Prepare and tokenize datasets with caching
-def prepare_datasets(train_files, test_files, tokenizer, cache_dir, max_length=512):
+def prepare_datasets(train_files, test_files, tokenizer, cache_dir):
     """Prepare and tokenize datasets with caching."""
     # Create raw datasets or load from cache
     train_raw_cache_dir = os.path.join(cache_dir, "raw_train")
@@ -267,11 +292,11 @@ def prepare_datasets(train_files, test_files, tokenizer, cache_dir, max_length=5
     os.makedirs(train_raw_cache_dir, exist_ok=True)
     os.makedirs(eval_raw_cache_dir, exist_ok=True)
 
-    train_dataset = create_text_dataset(train_files, train_raw_cache_dir, max_length)
-    eval_dataset = create_text_dataset(test_files, eval_raw_cache_dir, max_length)
+    train_dataset = create_text_dataset(train_files, train_raw_cache_dir)
+    eval_dataset = create_text_dataset(test_files, eval_raw_cache_dir)
 
     # Hash tokenizer configuration to include in cache key
-    tokenizer_config = f"{tokenizer.name_or_path}_{max_length}"
+    tokenizer_config = f"{tokenizer.name_or_path}_{args.max_length}"
     tokenizer_hash = hashlib.md5(tokenizer_config.encode()).hexdigest()
 
     # Check for cached tokenized datasets
@@ -290,7 +315,7 @@ def prepare_datasets(train_files, test_files, tokenizer, cache_dir, max_length=5
                 examples["text"],
                 padding="max_length",
                 truncation=True,
-                max_length=max_length,
+                max_length=args.max_length,
                 return_special_tokens_mask=True
             )
 
@@ -325,16 +350,9 @@ def configure_model_for_fine_tuning():
     # Configure quantization
     quantization_config = None
     if args.load_in_4bit:
-
-        if args.use_fp16:
-            bnb_4bit_compute_dtype = torch.float16
-        elif args.use_bf16:
-            bnb_4bit_compute_dtype = torch.bfloat16
-        else:
-            bnb_4bit_compute_dtype = torch.float32
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
+            bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=args.use_double_quant,
             bnb_4bit_quant_type="nf4"
         )
@@ -382,6 +400,11 @@ def configure_model_for_fine_tuning():
 # STEP 5: Configure training arguments
 def get_training_args(batch_size, gradient_accumulation_steps):
     """Get training arguments with memory optimizations."""
+    # Configure reporting based on wandb settings
+    report_to = ["none"]
+    if args.use_wandb:
+        report_to = ["wandb"]
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=batch_size,
@@ -394,7 +417,8 @@ def get_training_args(batch_size, gradient_accumulation_steps):
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_total_limit=args.save_total_limit,
-        report_to="none",
+        report_to=report_to,
+        run_name=args.wandb_run_name if args.use_wandb else None,
     )
 
     # Set precision flags
@@ -414,6 +438,32 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
     """Train the model with memory optimizations."""
     print(f"Training with batch size: {batch_size}, grad accum: {gradient_accumulation_steps}")
 
+    # Log to wandb
+    if args.use_wandb and wandb.run is not None:
+        wandb.log({
+            "training/batch_size": batch_size,
+            "training/grad_accum_steps": gradient_accumulation_steps,
+            "training/effective_batch_size": batch_size * gradient_accumulation_steps,
+            "training/learning_rate": args.learning_rate,
+            "training/num_epochs": args.num_epochs,
+            "training/train_samples": len(train_dataset),
+            "training/eval_samples": len(eval_dataset)
+        })
+
+    # Create custom callback to log GPU usage periodically
+    class GPULoggingCallback(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            # Log GPU usage every few steps
+            if state.global_step % 10 == 0:
+                log_gpu_usage(log_to_wandb=True)
+
+        def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+            # Log evaluation metrics to wandb
+            if args.use_wandb and wandb.run is not None and metrics:
+                # Add eval/ prefix to all metrics for better organization in wandb
+                wandb_metrics = {f"eval/{k}": v for k, v in metrics.items()}
+                wandb.log(wandb_metrics, step=state.global_step)
+
     # Use DataCollator for language modeling
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
@@ -430,10 +480,16 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
+        callbacks=[GPULoggingCallback()]
     )
 
     # Train the model
-    trainer.train()
+    train_result = trainer.train()
+
+    # Log final training metrics
+    if args.use_wandb and wandb.run is not None:
+        metrics = train_result.metrics
+        wandb.log({f"training/{k}": v for k, v in metrics.items()})
 
     # Save the model
     trainer.save_model(args.output_dir)
@@ -470,6 +526,11 @@ def evaluate_perplexity(model, tokenizer, eval_dataset):
     # Calculate perplexity
     perplexity = math.exp(total_loss / total_tokens)
     print(f"Perplexity: {perplexity:.2f}")
+
+    # Log perplexity to wandb if enabled
+    if args.use_wandb and wandb.run is not None:
+        wandb.log({"eval/perplexity": perplexity})
+
     return perplexity
 
 # STEP 8: Find maximum batch size through binary search
@@ -481,6 +542,14 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
 
     logging.info("Starting binary search for maximum batch size")
     logging.info(f"Initial search range: {min_batch} to {max_batch}")
+
+    # Log to wandb
+    if args.use_wandb and wandb.run is not None:
+        wandb.log({
+            "batch_search/min_batch": min_batch,
+            "batch_search/max_batch": max_batch,
+            "batch_search/start_time": time.time()
+        })
 
     # First try a conservative batch size to establish a baseline
     safe_batch_size = args.safe_batch_size
@@ -508,9 +577,23 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
         optimal_batch = safe_batch_size
         min_batch = safe_batch_size
         logging.info(f"Safe batch size {safe_batch_size} works! Continuing search...")
+
+        # Log to wandb
+        if args.use_wandb and wandb.run is not None:
+            wandb.log({
+                "batch_search/safe_batch_size_success": True,
+                "batch_search/current_optimal": optimal_batch
+            })
     except Exception as e:
         logging.warning(f"Even safe batch size {safe_batch_size} failed: {e}")
         logging.info("Falling back to batch size 1")
+
+        # Log to wandb
+        if args.use_wandb and wandb.run is not None:
+            wandb.log({
+                "batch_search/safe_batch_size_success": False,
+                "batch_search/fallback_batch_size": 1
+            })
         return 1
 
     # Release memory before continuing
@@ -527,7 +610,7 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
         grad_accum_steps = max(1, args.base_grad_accum // mid_batch)  # Ensure at least 1
         try:
             logging.info(f"Trying batch size: {mid_batch} with gradient accumulation steps: {grad_accum_steps}")
-            log_gpu_usage()
+            log_gpu_usage(log_to_wandb=True)
 
             # Test if this batch size works by running one training step
             training_args = get_training_args(mid_batch, grad_accum_steps)
@@ -551,15 +634,43 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
             optimal_batch = mid_batch
             logging.info(f"Batch size {mid_batch} works!")
             min_batch = mid_batch + 1
+
+            # Log to wandb
+            if args.use_wandb and wandb.run is not None:
+                wandb.log({
+                    "batch_search/tried_batch_size": mid_batch,
+                    "batch_search/batch_success": True,
+                    "batch_search/gradient_accumulation": grad_accum_steps,
+                    "batch_search/effective_batch": mid_batch * grad_accum_steps,
+                    "batch_search/current_optimal": optimal_batch
+                })
         except RuntimeError as e:
             if "CUDA out of memory" in str(e) or "not enough memory" in str(e):
                 # If OOM error, try smaller batch size
                 logging.info(f"OOM error at batch size {mid_batch}")
                 max_batch = mid_batch - 1
+
+                # Log to wandb
+                if args.use_wandb and wandb.run is not None:
+                    wandb.log({
+                        "batch_search/tried_batch_size": mid_batch,
+                        "batch_search/batch_success": False,
+                        "batch_search/oom_error": True,
+                        "batch_search/new_max_bound": max_batch
+                    })
             else:
                 # For other errors, log and try smaller batch size
                 logging.warning(f"Error at batch size {mid_batch}: {e}")
                 max_batch = mid_batch - 1
+
+                # Log to wandb
+                if args.use_wandb and wandb.run is not None:
+                    wandb.log({
+                        "batch_search/tried_batch_size": mid_batch,
+                        "batch_search/batch_success": False,
+                        "batch_search/other_error": True,
+                        "batch_search/new_max_bound": max_batch
+                    })
 
         # Always clean up GPU memory after each test
         model.zero_grad(set_to_none=True)
@@ -569,6 +680,16 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
         time.sleep(2)
 
     logging.info(f"Maximum batch size found: {optimal_batch}")
+
+    # Final batch search results to wandb
+    if args.use_wandb and wandb.run is not None:
+        wandb.log({
+            "batch_search/final_batch_size": optimal_batch,
+            "batch_search/final_grad_accum": max(1, args.base_grad_accum // optimal_batch),
+            "batch_search/final_effective_batch": optimal_batch * max(1, args.base_grad_accum // optimal_batch),
+            "batch_search/end_time": time.time()
+        })
+
     return optimal_batch
 
 
@@ -587,12 +708,34 @@ def main():
     for arg in vars(args):
         logging.info(f"  {arg}: {getattr(args, arg)}")
 
+    # Initialize wandb if enabled
+    if args.use_wandb:
+        wandb_tags = args.wandb_tags.split(",") if args.wandb_tags else None
+        run_name = args.wandb_run_name if args.wandb_run_name else f"llama-ft-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+        logging.info(f"Initializing Weights & Biases with project: {args.wandb_project}, run name: {run_name}")
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            tags=wandb_tags,
+            config=vars(args)  # Track all arguments as config
+        )
+
+        # Log hardware info to wandb
+        if torch.cuda.is_available():
+            wandb.config.update({
+                "gpu_count": torch.cuda.device_count(),
+                "gpu_name": torch.cuda.get_device_name(0),
+                "cuda_version": torch.version.cuda,
+            })
+
     try:
         # Create necessary directories
         create_directories(args.data_dir, args.output_dir, args.cache_dir)
 
         # Log initial GPU usage
-        log_gpu_usage()
+        log_gpu_usage(log_to_wandb=args.use_wandb)
 
         # Load preprocessed files from the data directory
         logging.info("Step 1: Loading preprocessed text files...")
@@ -633,8 +776,7 @@ def main():
             train_files,
             test_files,
             tokenizer,
-            cache_dir=args.cache_dir,
-            max_length=args.max_length
+            cache_dir=args.cache_dir
         )
         logging.info(f"Train dataset size: {len(train_dataset)} samples")
         logging.info(f"Eval dataset size: {len(eval_dataset)} samples")
@@ -659,11 +801,33 @@ def main():
         hours, remainder = divmod(elapsed_time, 3600)
         minutes, seconds = divmod(remainder, 60)
 
-        logging.info(f"Training complete in {int(hours)}h {int(minutes)}m {int(seconds)}s!")
+        # Format time for logging
+        time_str = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+
+        logging.info(f"Training complete in {time_str}!")
         logging.info(f"Maximum batch size: {max_batch_size}")
         logging.info(f"Gradient accumulation steps: {grad_accum_steps}")
         logging.info(f"Effective batch size: {max_batch_size * grad_accum_steps}")
         logging.info(f"Final perplexity: {perplexity:.2f}")
+
+        # Final metrics to wandb
+        if args.use_wandb and wandb.run is not None:
+            wandb.log({
+                "training/final_perplexity": perplexity,
+                "training/max_batch_size": max_batch_size,
+                "training/grad_accum_steps": grad_accum_steps,
+                "training/effective_batch_size": max_batch_size * grad_accum_steps,
+                "training/total_time_seconds": elapsed_time
+            })
+
+            # Log final model as artifact
+            model_artifact = wandb.Artifact(
+                name=f"finetuned-llama-{wandb.run.id}",
+                type="model",
+                description="LoRA finetuned LLaMA model"
+            )
+            model_artifact.add_dir(args.output_dir)
+            wandb.log_artifact(model_artifact)
 
         # Save training stats
         with open(os.path.join(args.output_dir, "training_stats.txt"), "w") as f:
@@ -672,16 +836,24 @@ def main():
             f.write(f"Gradient accumulation steps: {grad_accum_steps}\n")
             f.write(f"Effective batch size: {max_batch_size * grad_accum_steps}\n")
             f.write(f"Final perplexity: {perplexity:.2f}\n")
-            f.write(f"Total training time: {int(hours)}h {int(minutes)}m {int(seconds)}s\n")
+            f.write(f"Total training time: {time_str}\n")
             # Save all arguments
             f.write("\nArguments:\n")
             for arg in vars(args):
                 f.write(f"  {arg}: {getattr(args, arg)}\n")
 
+        # Finish wandb run
+        if args.use_wandb and wandb.run is not None:
+            wandb.finish()
+
         return max_batch_size, grad_accum_steps, perplexity
 
     except Exception as e:
         logging.error(f"Error during training: {e}", exc_info=True)
+        # Log the error to wandb
+        if args.use_wandb and wandb.run is not None:
+            wandb.log({"error": str(e)})
+            wandb.finish(exit_code=1)
         raise
 
 if __name__ == "__main__":
