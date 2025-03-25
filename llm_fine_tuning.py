@@ -480,10 +480,10 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
 
         def on_evaluate(self, args, state, control, metrics=None, **kwargs):
             # Log evaluation metrics to wandb
-            if args.use_wandb and wandb.run is not None and metrics:
+            if use_wandb:
                 # Add eval/ prefix to all metrics for better organization in wandb
                 wandb_metrics = {f"eval/{k}": v for k, v in metrics.items()}
-                wandb.log(wandb_metrics, step=state.global_step)
+                wandb.log(wandb_metrics)
 
     # Use DataCollator for language modeling
     data_collator = DataCollatorForLanguageModeling(
