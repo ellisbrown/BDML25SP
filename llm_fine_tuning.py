@@ -434,6 +434,24 @@ def get_training_args(batch_size, gradient_accumulation_steps):
 
     return training_args
 
+# Create a custom trainer that adds perplexity to metrics
+class PplxTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def log(self, logs, start_time=None):
+        """
+        Add perplexity to logs
+        """
+        if "loss" in logs:
+            logs["pplx"] = torch.exp(torch.tensor(logs["loss"])).item()
+        if "eval_loss" in logs:
+            logs["eval_pplx"] = torch.exp(torch.tensor(logs["eval_loss"])).item()
+
+        super().log(logs, start_time)
+
+
+
 # STEP 6: Train the model
 def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gradient_accumulation_steps=8):
     """Train the model with memory optimizations."""
@@ -443,13 +461,13 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
     use_wandb = args.use_wandb and wandb.run is not None
     if use_wandb:
         wandb.log({
-            "training/batch_size": batch_size,
-            "training/grad_accum_steps": gradient_accumulation_steps,
-            "training/effective_batch_size": batch_size * gradient_accumulation_steps,
-            "training/learning_rate": args.learning_rate,
-            "training/num_epochs": args.num_epochs,
-            "training/train_samples": len(train_dataset),
-            "training/eval_samples": len(eval_dataset)
+            "train/batch_size": batch_size,
+            "train/grad_accum_steps": gradient_accumulation_steps,
+            "train/effective_batch_size": batch_size * gradient_accumulation_steps,
+            "train/learning_rate": args.learning_rate,
+            "train/num_epochs": args.num_epochs,
+            "train/train_samples": len(train_dataset),
+            "train/eval_samples": len(eval_dataset)
         })
 
     # Create custom callback to log GPU usage periodically
@@ -476,13 +494,14 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
     training_args = get_training_args(batch_size, gradient_accumulation_steps)
 
     # Initialize Trainer
-    trainer = Trainer(
+    trainer = PplxTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        callbacks=[GPULoggingCallback()]
+        callbacks=[GPULoggingCallback()],
+        label_names=["labels"],  # Add this line to silence Peft warning
     )
 
     # Train the model
@@ -491,7 +510,7 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
     # Log final training metrics
     if args.use_wandb and wandb.run is not None:
         metrics = train_result.metrics
-        wandb.log({f"training/{k}": v for k, v in metrics.items()})
+        wandb.log({f"train/{k}": v for k, v in metrics.items()})
 
     # Run final evaluation
     eval_metrics = trainer.evaluate()
@@ -563,12 +582,13 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
     try:
         grad_accum_steps = max(1, args.base_grad_accum // safe_batch_size)
         training_args = get_training_args(safe_batch_size, grad_accum_steps)
-        trainer = Trainer(
+        trainer = PplxTrainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset.select(range(min(20, len(train_dataset)))),
             eval_dataset=eval_dataset.select(range(min(20, len(eval_dataset)))),
             data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+            label_names=["labels"],  # Add this line to silence Peft warning
         )
         trainer.train_dataloader = trainer.get_train_dataloader()
         batch = next(iter(trainer.train_dataloader))
@@ -620,12 +640,13 @@ def find_max_batch_size(model, tokenizer, train_dataset, eval_dataset):
 
             # Test if this batch size works by running one training step
             training_args = get_training_args(mid_batch, grad_accum_steps)
-            trainer = Trainer(
+            trainer = PplxTrainer(
                 model=model,
                 args=training_args,
                 train_dataset=train_dataset.select(range(min(20, len(train_dataset)))),
                 eval_dataset=eval_dataset.select(range(min(20, len(eval_dataset)))),
                 data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+                label_names=["labels"],  # Add this line to silence Peft warning
             )
             trainer.train_dataloader = trainer.get_train_dataloader()
             batch = next(iter(trainer.train_dataloader))
@@ -819,11 +840,11 @@ def main():
         # Final metrics to wandb
         if args.use_wandb and wandb.run is not None:
             wandb.log({
-                "training/final_perplexity": perplexity,
-                "training/max_batch_size": max_batch_size,
-                "training/grad_accum_steps": grad_accum_steps,
-                "training/effective_batch_size": max_batch_size * grad_accum_steps,
-                "training/total_time_seconds": elapsed_time
+                "train/final_perplexity": perplexity,
+                "train/max_batch_size": max_batch_size,
+                "train/grad_accum_steps": grad_accum_steps,
+                "train/effective_batch_size": max_batch_size * grad_accum_steps,
+                "train/total_time_seconds": elapsed_time
             })
 
             # Log final model as artifact

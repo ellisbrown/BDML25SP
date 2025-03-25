@@ -9,9 +9,14 @@ echo "Starting LLaMA fine-tuning with memory optimizations..."
 MODEL_PATH="/root/bdml25sp/datasets/BDML25SP/Llama3.2-3B-converted"  # Path to the converted model
 DATA_DIR="./processed_data"
 OUTPUT_DIR="./llama-finetuned"
+LOGS_DIR="./logs"
+
+# Create directories
+mkdir -p "$OUTPUT_DIR"
+mkdir -p "$LOGS_DIR"
 
 # Set GPU device
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=0
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -26,9 +31,9 @@ python llm_fine_tuning.py \
     --max_length 512 \
     --seed 42 \
     --start_batch_size 2 \
-    --max_batch_size 128 \
+    --max_batch_size 32 \
     --safe_batch_size 2 \
-    --base_grad_accum 32 \
+    --base_grad_accum 1 \
     --lora_r 8 \
     --lora_alpha 32 \
     --lora_dropout 0.1 \
@@ -38,8 +43,8 @@ python llm_fine_tuning.py \
     --use_gradient_checkpointing \
     --use_8bit_optimizer \
     --use_double_quant \
-    --logging_steps 10 \
-    --eval_steps 100 \
+    --logging_steps 1 \
+    --eval_steps 10 \
     --save_steps 500 \
     --save_total_limit 1 \
     --device "cuda:0" \
