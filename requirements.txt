@@ -1,0 +1,5 @@
+bitsandbytes
+transformers
+accelerate
+peft
+PyPDF2
