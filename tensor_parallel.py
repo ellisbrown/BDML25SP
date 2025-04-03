@@ -1,3 +1,4 @@
+print("tensor_parallel.py")
 import os
 import torch
 import torch.distributed as dist
@@ -16,8 +17,9 @@ from transformers import (
     DataCollatorForLanguageModeling,
     TrainingArguments,
     Trainer,
-    TrainerCallback
 )
+from transformers.trainer_callback import TrainerCallback
+
 
 # Try to import tensor parallelism from different libraries
 try:
@@ -165,7 +167,7 @@ def train_with_tensor_parallelism(args):
         train_files, test_files = split_train_test(txt_files, args.train_test_split)
 
     train_dataset, eval_dataset = prepare_datasets(
-        train_files, test_files, tokenizer, args.cache_dir
+        train_files, test_files, tokenizer, args.cache_dir, args
     )
 
     # Configure data collator
@@ -227,8 +229,8 @@ def train_with_tensor_parallelism(args):
 
         # Run evaluation
         eval_metrics = trainer.evaluate()
-        perplexity = evaluate_perplexity(model, tokenizer, eval_dataset)
-        
+        perplexity = evaluate_perplexity(model, tokenizer, eval_dataset, args)
+
         logging.info(f"Final perplexity: {perplexity:.2f}")
         logging.info(f"Final evaluation metrics: {eval_metrics}")
 

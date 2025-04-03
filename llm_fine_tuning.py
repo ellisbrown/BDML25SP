@@ -126,6 +126,12 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Device to use for training (e.g., cuda:0)")
 
+    # dummy for HW2
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Batch size for training")
+    parser.add_argument("--parallelism_type", type=str, choices=["data", "tensor", "pipeline", "all"],
+                        default="data", help="Type of parallelism to use")
+
     args = parser.parse_args()
 
     # Convert comma-separated target modules to list
@@ -246,7 +252,7 @@ def hash_file_paths(file_paths):
     return hash_obj.hexdigest()
 
 # Create raw text dataset with caching
-def create_text_dataset(file_paths, cache_dir):
+def create_text_dataset(file_paths, cache_dir, args=args):
     """Create dataset of raw texts from files with caching."""
     # Create a hash of the file paths to use as cache key
     files_hash = hash_file_paths(file_paths)
@@ -293,7 +299,7 @@ def create_text_dataset(file_paths, cache_dir):
     return dataset
 
 # Prepare and tokenize datasets with caching
-def prepare_datasets(train_files, test_files, tokenizer, cache_dir):
+def prepare_datasets(train_files, test_files, tokenizer, cache_dir, args=args):
     """Prepare and tokenize datasets with caching."""
     # Create raw datasets or load from cache
     train_raw_cache_dir = os.path.join(cache_dir, "raw_train")
@@ -353,7 +359,7 @@ def prepare_datasets(train_files, test_files, tokenizer, cache_dir):
     return train_tokenized, eval_tokenized
 
 # STEP 4: Configure model with memory optimizations
-def configure_model_for_fine_tuning():
+def configure_model_for_fine_tuning(args=args):
     """Configure LLaMA model with memory optimizations."""
 
     # Configure quantization
@@ -556,7 +562,7 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, batch_size=1, gra
     return trainer, metrics, eval_metrics
 
 # STEP 7: Evaluate the model using perplexity
-def evaluate_perplexity(model, tokenizer, eval_dataset):
+def evaluate_perplexity(model, tokenizer, eval_dataset, args=args):
     """Evaluate the model using perplexity metric."""
     model.eval()
     total_loss = 0

@@ -6,10 +6,6 @@ import time
 import torch
 from datetime import datetime
 
-# Import all parallelism implementations
-from data_parallel import train_with_data_parallelism
-from tensor_parallel import train_with_tensor_parallelism
-from pipeline_parallel import train_with_pipeline_parallelism
 
 # Set up logging
 logging.basicConfig(
@@ -25,7 +21,7 @@ def get_available_gpus():
     """Get the number of available GPUs"""
     return torch.cuda.device_count()
 
-def parse_args():
+def parse_args_distributed():
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(description="Distributed LLM fine-tuning")
 
@@ -109,6 +105,8 @@ def parse_args():
 
     args = parser.parse_args()
 
+    print(f"Arguments: {args}")
+
     # Convert comma-separated target modules to list
     args.lora_target_modules = args.lora_target_modules.split(",") if args.lora_target_modules else []
 
@@ -166,6 +164,8 @@ def run_distributed_training(args):
 
     # Run appropriate parallelism strategy
     if args.parallelism_type == "data" or args.parallelism_type == "all":
+        from data_parallel import train_with_data_parallelism
+
         logging.info("Running Data Parallelism")
         data_output_dir = os.path.join(args.output_dir, "data_parallel")
         os.makedirs(data_output_dir, exist_ok=True)
@@ -180,6 +180,8 @@ def run_distributed_training(args):
         logging.info(f"Data Parallelism - Average epoch time: {sum(data_epoch_times)/len(data_epoch_times):.2f} seconds")
 
     if args.parallelism_type == "tensor" or args.parallelism_type == "all":
+        from tensor_parallel import train_with_tensor_parallelism
+
         logging.info("Running Tensor Parallelism")
         tensor_output_dir = os.path.join(args.output_dir, "tensor_parallel")
         os.makedirs(tensor_output_dir, exist_ok=True)
@@ -194,6 +196,8 @@ def run_distributed_training(args):
         logging.info(f"Tensor Parallelism - Average epoch time: {sum(tensor_epoch_times)/len(tensor_epoch_times):.2f} seconds")
 
     if args.parallelism_type == "pipeline" or args.parallelism_type == "all":
+        from pipeline_parallel import train_with_pipeline_parallelism
+
         logging.info("Running Pipeline Parallelism")
         pipeline_output_dir = os.path.join(args.output_dir, "pipeline_parallel")
         os.makedirs(pipeline_output_dir, exist_ok=True)
@@ -218,5 +222,5 @@ def run_distributed_training(args):
     return 0
 
 if __name__ == "__main__":
-    args = parse_args()
+    args = parse_args_distributed()
     run_distributed_training(args)

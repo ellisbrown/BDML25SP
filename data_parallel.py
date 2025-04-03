@@ -20,6 +20,7 @@ from transformers import (
     TrainingArguments,
     Trainer
 )
+from transformers.trainer_callback import TrainerCallback
 from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 
 class TimingCallback(TrainerCallback):
@@ -88,7 +89,7 @@ def train_with_data_parallelism(args):
         train_files, test_files = split_train_test(txt_files, args.train_test_split)
 
     train_dataset, eval_dataset = prepare_datasets(
-        train_files, test_files, tokenizer, args.cache_dir
+        train_files, test_files, tokenizer, args.cache_dir, args
     )
 
     # Use DistributedSampler for data parallelism
@@ -168,7 +169,7 @@ def train_with_data_parallelism(args):
 
         # Run evaluation
         eval_metrics = trainer.evaluate()
-        perplexity = evaluate_perplexity(model, tokenizer, eval_dataset)
+        perplexity = evaluate_perplexity(model, tokenizer, eval_dataset, args)
 
         logging.info(f"Final perplexity: {perplexity:.2f}")
         logging.info(f"Final evaluation metrics: {eval_metrics}")

@@ -1,3 +1,4 @@
+print("pipeline_parallel.py")
 import os
 import torch
 import torch.distributed as dist
@@ -16,8 +17,8 @@ from transformers import (
     DataCollatorForLanguageModeling,
     TrainingArguments,
     Trainer,
-    TrainerCallback
 )
+from transformers.trainer_callback import TrainerCallback
 
 # Try to import pipeline parallelism
 try:
@@ -201,7 +202,7 @@ def train_with_pipeline_parallelism(args):
         train_files, test_files = split_train_test(txt_files, args.train_test_split)
 
     train_dataset, eval_dataset = prepare_datasets(
-        train_files, test_files, tokenizer, args.cache_dir
+        train_files, test_files, tokenizer, args.cache_dir, args
     )
 
     # Configure data collator
@@ -267,7 +268,7 @@ def train_with_pipeline_parallelism(args):
             logging.info(f"Epoch {i+1} time: {epoch_time:.2f} seconds")
 
         # Run evaluation on original model to get perplexity
-        perplexity = evaluate_perplexity(model, tokenizer, eval_dataset)
+        perplexity = evaluate_perplexity(model, tokenizer, eval_dataset, args)
 
         logging.info(f"Final perplexity: {perplexity:.2f}")
 
