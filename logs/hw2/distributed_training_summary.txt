@@ -1,0 +1,5 @@
+Distributed Training Summary
+=========================
+Date: Thu 03 Apr 2025 03:28:07 PM PDT
+GPUs used: 2
+=========================

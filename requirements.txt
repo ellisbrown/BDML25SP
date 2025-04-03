@@ -1,7 +1,7 @@
 bitsandbytes
 transformers
 datasets
-accelerate
+accelerate>=0.25.0
 peft
 PyPDF2
 psutil
@@ -10,5 +10,5 @@ tiktoken
 sentencepiece
 blobfile
 wandb
-# flash-attn  # Requires manual installation with: pip install flash-attn --no-build-isolation
 deepspeed
+# flash-attn  # Requires manual installation with: pip install flash-attn --no-build-isolation
