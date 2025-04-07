@@ -1,0 +1,38 @@
+{
+    "train_batch_size": "auto",
+    "train_micro_batch_size_per_gpu": "auto",
+    "gradient_accumulation_steps": "auto",
+    "steps_per_print": 10,
+    "zero_optimization": {
+        "stage": 0
+    },
+    "gradient_clipping": 1.0,
+    "bf16": {
+        "enabled": true
+    },
+    "tensorboard": {
+        "enabled": true,
+        "output_path": "./runs/tensor_parallel",
+        "job_name": "tensorparallel"
+    },
+    "activation_checkpointing": {
+        "partition_activations": true,
+        "cpu_checkpointing": false,
+        "contiguous_memory_optimization": true,
+        "number_checkpoints": null,
+        "synchronize_checkpoint_boundary": false,
+        "profile": false
+    },
+    "amp": {
+        "enabled": false
+    },
+    "wall_clock_breakdown": true,
+    "flops_profiler": {
+        "enabled": true,
+        "profile_step": 10,
+        "module_depth": -1,
+        "top_modules": 1,
+        "detailed": true,
+        "output_file": null
+    }
+}
