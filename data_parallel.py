@@ -11,16 +11,20 @@ from functools import partial
 
 # Import your existing functions
 from llm_fine_tuning import (
-    parse_args, configure_model_for_fine_tuning, prepare_datasets,
-    evaluate_perplexity, log_gpu_usage, get_training_args
+    parse_args, prepare_datasets,
+    evaluate_perplexity, log_gpu_usage, get_training_args,
+    split_train_test
 )
 
 from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
     DataCollatorForLanguageModeling,
     TrainingArguments,
-    Trainer
+    Trainer,
+    TrainerCallback,
+    BitsAndBytesConfig
 )
-from transformers.trainer_callback import TrainerCallback
 from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 
 class TimingCallback(TrainerCallback):
@@ -44,6 +48,80 @@ class TimingCallback(TrainerCallback):
                 import wandb
                 wandb.log({"train/epoch_time": epoch_time})
 
+# Modified configuration function
+def configure_model_for_distributed(args, local_rank):
+    """Configure model with quantization for distributed training"""
+    logging.info("Configuring model for distributed training")
+
+    # Configure quantization
+    quantization_config = None
+    if args.load_in_4bit:
+        logging.info("Loading in 4-bit precision")
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=args.use_double_quant,
+            bnb_4bit_quant_type="nf4",
+            llm_int8_enable_fp32_cpu_offload=True
+        )
+    elif args.load_in_8bit:
+        logging.info("Loading in 8-bit precision")
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True
+        )
+
+    # Attention implementation
+    attn_implementation = None
+    if args.flash_attention:
+        logging.info("Using Flash Attention")
+        attn_implementation = "flash_attention_2"
+    elif args.sdpa_attention:
+        logging.info("Using SDPA Attention")
+        attn_implementation = "sdpa"
+
+    # Load tokenizer
+    logging.info(f"Loading tokenizer from {args.model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    # Set device map for proper distribution
+    # For data parallelism, we want the model on the specific local GPU
+    device_map = {"": local_rank} if local_rank != -1 else "auto"
+
+    # Load model with quantization - IMPORTANT: do not use DDP here yet
+    logging.info(f"Loading model from {args.model_path}")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        quantization_config=quantization_config,
+        device_map=device_map,
+        attn_implementation=attn_implementation if attn_implementation else None,
+        trust_remote_code=True,
+    )
+
+    # Prepare model for k-bit training
+    logging.info("Preparing model for k-bit training")
+    model = prepare_model_for_kbit_training(model)
+
+    # Enable gradient checkpointing if requested
+    if args.use_gradient_checkpointing:
+        logging.info("Enabling gradient checkpointing")
+        model.gradient_checkpointing_enable()
+
+    # Apply LoRA to the model
+    logging.info("Applying LoRA to model")
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=args.lora_target_modules,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM
+    )
+    model = get_peft_model(model, lora_config)
+
+    # Don't wrap in DDP here - we'll do it separately later if needed
+    return model, tokenizer
+
 # Data Parallel Training function
 def train_with_data_parallelism(args):
     """
@@ -61,11 +139,8 @@ def train_with_data_parallelism(args):
         dist.init_process_group("nccl")
         torch.cuda.set_device(local_rank)
 
-    # Set device
-    device = torch.device(f"cuda:{local_rank}" if local_rank != -1 else "cuda:0")
-
-    # Configure model and tokenizer
-    model, tokenizer = configure_model_for_fine_tuning(args)
+    # Configure model and tokenizer (already handles device placement)
+    model, tokenizer = configure_model_for_distributed(args, local_rank)
 
     # Load datasets
     from glob import glob
@@ -98,7 +173,7 @@ def train_with_data_parallelism(args):
         num_replicas=world_size,
         rank=rank,
         shuffle=True
-    )
+    ) if local_rank != -1 else None
 
     # Configure data collator
     data_collator = DataCollatorForLanguageModeling(
@@ -106,9 +181,19 @@ def train_with_data_parallelism(args):
         mlm=False
     )
 
-    # If using local_rank for distributed training
+    # Now wrap with DDP if needed (AFTER LoRA is applied)
     if local_rank != -1:
-        model = model.to(device)
+        # Convert any BitsAndBytes modules if needed
+        # Find modules not compatible with DDP
+        non_ddp_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                non_ddp_params.append(name)
+
+        if non_ddp_params:
+            logging.info(f"Found {len(non_ddp_params)} parameters not compatible with DDP. These will not be synced.")
+
+        # Create DDP model with appropriate settings
         model = DDP(
             model,
             device_ids=[local_rank],
@@ -153,6 +238,10 @@ def train_with_data_parallelism(args):
         data_collator=data_collator,
         callbacks=[timing_callback],
     )
+
+    # If using distributed, set the train sampler
+    if train_sampler is not None:
+        trainer.train_dataloader = trainer.get_train_dataloader()
 
     # Start training
     start_time = time.time()

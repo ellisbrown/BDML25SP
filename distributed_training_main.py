@@ -72,7 +72,7 @@ def parse_args_distributed():
                         help="Load model in 4-bit precision")
     parser.add_argument("--load_in_8bit", action="store_true", default=False,
                         help="Load model in 8-bit precision")
-    parser.add_argument("--use_fp16", action="store_true", default=True,
+    parser.add_argument("--use_fp16", action="store_true", default=False,
                         help="Use mixed precision training (FP16)")
     parser.add_argument("--use_bf16", action="store_true", default=False,
                         help="Use mixed precision training (BF16)")
