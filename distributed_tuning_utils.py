@@ -6,7 +6,6 @@ import math
 import random
 import logging
 import argparse
-import deepspeed
 import numpy as np
 from tqdm import tqdm
 import glob
@@ -21,15 +20,19 @@ from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_tr
 from datasets import Dataset, load_from_disk
 
 # Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(f"logs/distributed_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-        logging.StreamHandler()
-    ]
-)
+def setup_logging():
+    """Set up logging configuration"""
+    os.makedirs("logs", exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(f"logs/distributed_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+            logging.StreamHandler()
+        ]
+    )
 
+# Common argument parsing function
 def parse_args():
     parser = argparse.ArgumentParser(description="Distributed fine-tuning of LLaMA on 2 GPUs")
 
@@ -46,8 +49,6 @@ def parse_args():
                         help="Path to DeepSpeed configuration file")
 
     # Distributed training parameters
-    parser.add_argument("--parallelism_type", type=str, choices=["dp", "tp", "pp"], default="dp",
-                        help="Type of parallelism to use (data, tensor, or pipeline)")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="Local rank for distributed training (set by DeepSpeed launcher)")
 
@@ -99,6 +100,10 @@ def parse_args():
     parser.add_argument("--use_gradient_checkpointing", action="store_true", default=True,
                         help="Enable gradient checkpointing")
 
+    # Pipeline parallelism specific
+    parser.add_argument("--num_stages", type=int, default=2,
+                        help="Number of pipeline stages (for pipeline parallelism)")
+
     # Logging and evaluation
     parser.add_argument("--logging_steps", type=int, default=10,
                         help="Logging frequency during training (steps)")
@@ -116,45 +121,6 @@ def parse_args():
     args.lora_target_modules = args.lora_target_modules.split(",")
 
     return args
-
-def create_deepspeed_config(args):
-    """Create or update DeepSpeed config based on args"""
-    # If config file exists, load it
-    if os.path.exists(args.deepspeed_config):
-        with open(args.deepspeed_config, 'r') as f:
-            ds_config = json.load(f)
-    else:
-        # Create a basic DeepSpeed config
-        ds_config = {
-            "train_batch_size": args.per_device_batch_size * 2,  # 2 GPUs
-            "train_micro_batch_size_per_gpu": args.per_device_batch_size,
-            "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            "steps_per_print": args.logging_steps,
-        }
-
-        # Add ZeRO optimization for Data Parallelism
-        if args.parallelism_type == "dp":
-            ds_config["zero_optimization"] = {
-                "stage": 1,
-                "contiguous_gradients": True,
-                "overlap_comm": True,
-                "reduce_scatter": True,
-                "reduce_bucket_size": 5e8,
-                "allgather_bucket_size": 5e8
-            }
-
-        # Add precision settings
-        if args.use_fp16:
-            ds_config["fp16"] = {"enabled": True}
-        elif args.use_bf16:
-            ds_config["bf16"] = {"enabled": True}
-
-        # Add optimization settings
-        ds_config["gradient_clipping"] = 1.0
-        ds_config["wall_clock_breakdown"] = True
-        ds_config["zero_allow_untested_optimizer"] = True
-
-    return ds_config
 
 # Function to load and prepare datasets
 def prepare_datasets(args, tokenizer):
@@ -239,9 +205,9 @@ def prepare_datasets(args, tokenizer):
 
     return train_tokenized, test_tokenized
 
-# Configure model with memory optimizations
-def configure_model(args):
-    """Configure LLaMA model with LoRA and quantization"""
+# Configure model with LoRA and quantization
+def configure_model_base(args):
+    """Base configuration for the LLaMA model with LoRA and quantization"""
     # Configure quantization
     quantization_config = None
     if args.load_in_4bit:
@@ -259,7 +225,7 @@ def configure_model(args):
     # Load the model with quantization
     model_kwargs = dict(
         quantization_config=quantization_config,
-        device_map="auto",  # DeepSpeed will handle device placement
+        device_map="auto",  # Will be overridden by DeepSpeed
         trust_remote_code=True,
     )
 
@@ -317,106 +283,8 @@ def configure_model(args):
 
     return model, tokenizer
 
-# Define training loop
-def train(args, model, train_dataset, eval_dataset, tokenizer):
-    """Train the model with DeepSpeed"""
-    # DeepSpeed engine and data loader setup
-    parameters = filter(lambda p: p.requires_grad, model.parameters())
-
-    # Create DeepSpeed config
-    ds_config = create_deepspeed_config(args)
-
-    # Create data collator for language modeling
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False
-    )
-
-    # Initialize DeepSpeed engine
-    model_engine, optimizer, _, _ = deepspeed.initialize(
-        args=args,
-        model=model,
-        model_parameters=parameters,
-        config=ds_config
-    )
-
-    # Track elapsed time for each epoch
-    epoch_times = []
-
-    # Get total training steps
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.per_device_batch_size,
-        collate_fn=data_collator,
-        shuffle=True
-    )
-
-    total_steps = len(train_dataloader)
-    logging.info(f"Total training steps per epoch: {total_steps}")
-
-    # Training loop
-    for epoch in range(args.num_epochs):
-        epoch_start_time = time.time()
-        model_engine.train()
-        total_loss = 0
-
-        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
-        for step, batch in enumerate(progress_bar):
-            # Move batch to device
-            batch = {k: v.to(model_engine.device) for k, v in batch.items()}
-
-            # Forward pass
-            outputs = model_engine(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                labels=batch["labels"]
-            )
-            loss = outputs.loss
-
-            # Backward pass
-            model_engine.backward(loss)
-            model_engine.step()
-
-            # Update progress bar
-            total_loss += loss.item()
-            progress_bar.set_postfix({"loss": total_loss / (step + 1)})
-
-            # Log loss
-            if step % args.logging_steps == 0 and args.local_rank == 0:
-                logging.info(f"Epoch: {epoch+1}/{args.num_epochs}, Step: {step}/{total_steps}, Loss: {loss.item():.4f}")
-
-            # Evaluate periodically
-            if step % args.eval_steps == 0 and args.local_rank == 0 and step > 0:
-                eval_loss, perplexity = evaluate(args, model_engine, eval_dataset, tokenizer)
-                logging.info(f"Evaluation - Loss: {eval_loss:.4f}, Perplexity: {perplexity:.2f}")
-                model_engine.train()  # Back to training mode
-
-        # Measure epoch time
-        epoch_end_time = time.time()
-        epoch_time = epoch_end_time - epoch_start_time
-        epoch_times.append(epoch_time)
-
-        # Evaluate at the end of each epoch
-        if args.local_rank == 0:
-            eval_loss, perplexity = evaluate(args, model_engine, eval_dataset, tokenizer)
-            logging.info(f"Epoch {epoch+1} completed - Time: {epoch_time:.2f}s, Loss: {total_loss/total_steps:.4f}, Eval Loss: {eval_loss:.4f}, Perplexity: {perplexity:.2f}")
-
-        # Save model
-        if args.local_rank == 0:
-            output_dir = os.path.join(args.output_dir, f"epoch-{epoch+1}")
-            os.makedirs(output_dir, exist_ok=True)
-            model_engine.save_pretrained(output_dir)
-            tokenizer.save_pretrained(output_dir)
-            logging.info(f"Model saved to {output_dir}")
-
-    # Log average epoch time
-    avg_epoch_time = sum(epoch_times) / len(epoch_times)
-    logging.info(f"Average time per epoch: {avg_epoch_time:.2f}s")
-
-    return model_engine, epoch_times
-
 # Evaluate model with perplexity
-def evaluate(args, model, eval_dataset, tokenizer):
+def evaluate_perplexity(args, model, eval_dataset, tokenizer):
     """Evaluate the model using perplexity metric"""
     model.eval()
 
@@ -424,13 +292,6 @@ def evaluate(args, model, eval_dataset, tokenizer):
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False
-    )
-
-    eval_dataloader = torch.utils.data.DataLoader(
-        eval_dataset,
-        batch_size=args.per_device_batch_size,
-        collate_fn=data_collator,
-        shuffle=False
     )
 
     # Limit evaluation samples for faster evaluation
@@ -442,6 +303,13 @@ def evaluate(args, model, eval_dataset, tokenizer):
         random.shuffle(indices)
         indices = indices[:max_eval_samples]
         eval_dataset = eval_dataset.select(indices)
+
+    eval_dataloader = torch.utils.data.DataLoader(
+        eval_dataset,
+        batch_size=args.per_device_batch_size,
+        collate_fn=data_collator,
+        shuffle=False
+    )
 
     total_loss = 0
     total_tokens = 0
@@ -460,57 +328,13 @@ def evaluate(args, model, eval_dataset, tokenizer):
 
     return avg_loss, perplexity
 
-def main():
-    """Main function for distributed training"""
-    # Parse arguments
-    args = parse_args()
-
-    # Set random seed
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-
-    # Initialize distributed environment
-    deepspeed.init_distributed()
-
-    # Get local rank from environment variable (set by DeepSpeed launcher)
-    args.local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
-
-    # Create output directory
-    if args.local_rank == 0:
-        os.makedirs(args.output_dir, exist_ok=True)
-        os.makedirs(args.cache_dir, exist_ok=True)
-
-    logging.info(f"Starting distributed training with {args.parallelism_type} parallelism")
-    logging.info(f"Local rank: {args.local_rank}")
-
-    # Configure model
-    model, tokenizer = configure_model(args)
-
-    # Prepare datasets
-    train_dataset, eval_dataset = prepare_datasets(args, tokenizer)
-    logging.info(f"Train dataset size: {len(train_dataset)} samples")
-    logging.info(f"Eval dataset size: {len(eval_dataset)} samples")
-
-    # Train the model
-    start_time = time.time()
-    model, epoch_times = train(args, model, train_dataset, eval_dataset, tokenizer)
-    total_time = time.time() - start_time
-
-    # Final evaluation
-    if args.local_rank == 0:
-        eval_loss, perplexity = evaluate(args, model, eval_dataset, tokenizer)
-        logging.info(f"Final evaluation - Loss: {eval_loss:.4f}, Perplexity: {perplexity:.2f}")
-
-        # Log training statistics
-        logging.info(f"Training completed in {total_time:.2f} seconds")
-        for i, epoch_time in enumerate(epoch_times):
-            logging.info(f"Epoch {i+1} time: {epoch_time:.2f} seconds")
-
-        # Save training stats to file
+# Save training statistics
+def save_training_stats(args, total_time, epoch_times, perplexity, strategy):
+    """Save training statistics to a file"""
+    if args.local_rank == 0:  # Only save on main process
         stats_file = os.path.join(args.output_dir, "training_stats.txt")
         with open(stats_file, "w") as f:
-            f.write(f"Parallelism type: {args.parallelism_type}\n")
+            f.write(f"Parallelism type: {strategy}\n")
             f.write(f"Training completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Total training time: {total_time:.2f} seconds\n")
             f.write(f"Average time per epoch: {sum(epoch_times)/len(epoch_times):.2f} seconds\n")
@@ -518,7 +342,4 @@ def main():
             f.write(f"Total batch size: {args.per_device_batch_size * 2}\n")  # 2 GPUs
             f.write(f"Final perplexity: {perplexity:.2f}\n")
 
-    logging.info("Distributed training complete!")
-
-if __name__ == "__main__":
-    main()
+        logging.info(f"Training stats saved to {stats_file}")

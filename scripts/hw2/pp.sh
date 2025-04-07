@@ -1,24 +1,25 @@
 #!/bin/bash
 set -e
-echo "Starting distributed training with Data Parallelism..."
+echo "Starting distributed training with Pipeline Parallelism..."
 
 # Configure paths
 MODEL_PATH="/root/bdml25sp/datasets/BDML25SP/Llama3.2-3B-converted"
 DATA_DIR="./processed_data"
-OUTPUT_DIR="./checkpoints/hw2/dp"
-LOGS_DIR="./logs/hw2/dp"
+OUTPUT_DIR="./checkpoints/hw2/pp"
+LOGS_DIR="./logs/hw2/pp"
 
 # Create directories
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$LOGS_DIR"
 
-# Run DeepSpeed with 2 GPUs for Data Parallelism
+# Run DeepSpeed with 2 GPUs for Pipeline Parallelism
 deepspeed --num_gpus=2 \
-    distributed_tuning_dp.py \
+    distributed_tuning_pp.py \
     --model_path "$MODEL_PATH" \
     --data_dir "$DATA_DIR" \
     --output_dir "$OUTPUT_DIR" \
-    --deepspeed_config "./ds_config_dp.json" \
+    --deepspeed_config "./ds_config_pp.json" \
+    --num_stages 2 \
     --learning_rate 2e-4 \
     --num_epochs 1 \
     --max_length 512 \
@@ -37,4 +38,4 @@ deepspeed --num_gpus=2 \
     --eval_steps 100 \
     --save_steps 500
 
-echo "Data Parallel training complete! See $OUTPUT_DIR/training_stats.txt for results."
+echo "Pipeline Parallel training complete! See $OUTPUT_DIR/training_stats.txt for results."

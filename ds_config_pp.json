@@ -3,18 +3,14 @@
     "train_micro_batch_size_per_gpu": "auto",
     "gradient_accumulation_steps": "auto",
     "steps_per_print": 10,
-    "zero_optimization": {
-        "stage": 0
-    },
-    "gradient_clipping": 1.0,
     "bf16": {
         "enabled": true
     },
+    "gradient_clipping": 1.0,
+    "wall_clock_breakdown": true,
+    "zero_allow_untested_optimizer": true,
     "pipeline": {
         "enabled": true,
-        "pipe_partitioned": true,
-        "num_stages": 2,
-        "activation_checkpoint_interval": 0
-    },
-    "wall_clock_breakdown": true
+        "activation_checkpoint_interval": 1
+    }
 }
