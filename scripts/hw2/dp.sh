@@ -22,16 +22,15 @@ deepspeed --num_gpus=2 \
     --learning_rate 2e-4 \
     --num_epochs 1 \
     --max_length 512 \
-    --per_device_batch_size 8 \
+    --per_device_batch_size 56 \
     --gradient_accumulation_steps 1 \
     --seed 42 \
     --lora_r 8 \
     --lora_alpha 32 \
     --lora_dropout 0.1 \
     --lora_target_modules "q_proj,k_proj,v_proj,o_proj" \
-    --load_in_4bit \
+    --load_in_8bit \
     --use_bf16 \
-    --use_double_quant \
     --use_gradient_checkpointing \
     --logging_steps 10 \
     --eval_steps 100 \

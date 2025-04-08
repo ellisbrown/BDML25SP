@@ -101,7 +101,7 @@ def parse_args():
                         help="Enable gradient checkpointing")
 
     # Pipeline parallelism specific
-    parser.add_argument("--num_stages", type=int, default=2,
+    parser.add_argument("--num_stages", type=int, default=0,
                         help="Number of pipeline stages (for pipeline parallelism)")
 
     # Logging and evaluation
@@ -206,26 +206,28 @@ def prepare_datasets(args, tokenizer):
     return train_tokenized, test_tokenized
 
 # Configure model with LoRA and quantization
-def configure_model_base(args):
+def configure_model_base(args, device_map="auto"):
     """Base configuration for the LLaMA model with LoRA and quantization"""
     # Configure quantization
     quantization_config = None
-    if args.load_in_4bit:
+    if args.load_in_8bit:
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True
+        )
+    elif args.load_in_4bit:
+        # 4-bit quantization may cause compatibility issues with distributed training
+        # Using this only if explicitly requested and 8-bit is not enabled
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=args.use_double_quant,
             bnb_4bit_quant_type="nf4"
         )
-    elif args.load_in_8bit:
-        quantization_config = BitsAndBytesConfig(
-            load_in_8bit=True
-        )
 
     # Load the model with quantization
     model_kwargs = dict(
         quantization_config=quantization_config,
-        device_map="auto",  # Will be overridden by DeepSpeed
+        device_map=device_map,
         trust_remote_code=True,
     )
 

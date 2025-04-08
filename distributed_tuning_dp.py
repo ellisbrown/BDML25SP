@@ -38,7 +38,11 @@ def main():
     logging.info(f"Local rank: {args.local_rank}")
 
     # Configure model with LoRA and quantization
-    model, tokenizer = utils.configure_model_base(args)
+    logging.info(f"LOCAL_RANK: {os.environ.get('LOCAL_RANK')}")
+    logging.info(f"RANK: {os.environ.get('RANK')}")
+    logging.info(f"WORLD_SIZE: {os.environ.get('WORLD_SIZE')}")
+
+    model, tokenizer = utils.configure_model_base(args, device_map={"": int(os.environ.get("LOCAL_RANK", 0))})
 
     # Prepare datasets
     train_dataset, eval_dataset = utils.prepare_datasets(args, tokenizer)
@@ -55,11 +59,13 @@ def main():
 
     # Train with Data Parallelism
     start_time = time.time()
+
+    # When using deepspeed launcher, we should not pass the config again
+    # The config is already passed via the command line
     model_engine, optimizer, _, _ = deepspeed.initialize(
         args=args,
         model=model,
-        model_parameters=filter(lambda p: p.requires_grad, model.parameters()),
-        config=ds_config
+        model_parameters=filter(lambda p: p.requires_grad, model.parameters())
     )
 
     # Create data collator for language modeling
