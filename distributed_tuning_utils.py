@@ -20,14 +20,14 @@ from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_tr
 from datasets import Dataset, load_from_disk
 
 # Set up logging
-def setup_logging():
+def setup_logging(logdir="logs"):
     """Set up logging configuration"""
     os.makedirs("logs", exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(f"logs/distributed_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+            logging.FileHandler(f"{logdir}/distributed_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
             logging.StreamHandler()
         ]
     )
@@ -105,6 +105,8 @@ def parse_args():
                         help="Number of pipeline stages (for pipeline parallelism)")
 
     # Logging and evaluation
+    parser.add_argument("--log_dir", type=str, default="./logs",
+                        help="Directory to save logs in")
     parser.add_argument("--logging_steps", type=int, default=10,
                         help="Logging frequency during training (steps)")
     parser.add_argument("--eval_steps", type=int, default=100,
@@ -206,7 +208,7 @@ def prepare_datasets(args, tokenizer):
     return train_tokenized, test_tokenized
 
 # Configure model with LoRA and quantization
-def configure_model_base(args, device_map="auto"):
+def configure_model_base(args, device_map="auto", use_peft=False):
     """Base configuration for the LLaMA model with LoRA and quantization"""
     # Configure quantization
     quantization_config = None
@@ -249,26 +251,27 @@ def configure_model_base(args, device_map="auto"):
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Prepare model for k-bit training
-    model = prepare_model_for_kbit_training(model)
-
     # Enable gradient checkpointing if requested
     if args.use_gradient_checkpointing:
         model.gradient_checkpointing_enable()
         logging.info("Gradient checkpointing enabled")
 
-    # Configure LoRA
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=args.lora_target_modules,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM
-    )
+    if use_peft:
+        # Prepare model for k-bit training
+        model = prepare_model_for_kbit_training(model)
 
-    # Apply LoRA to the model
-    model = get_peft_model(model, lora_config)
+        # Configure LoRA
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=args.lora_target_modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM
+        )
+
+        # Apply LoRA to the model
+        model = get_peft_model(model, lora_config)
 
     # Log number of trainable parameters
     trainable_params = 0

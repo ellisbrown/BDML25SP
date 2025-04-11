@@ -12,11 +12,12 @@ import distributed_tuning_utils as utils
 
 def main():
     """Main function for Data Parallel distributed training"""
-    # Set up logging
-    utils.setup_logging()
 
     # Parse arguments
     args = utils.parse_args()
+
+    # Set up logging
+    utils.setup_logging(args.log_dir)
 
     # Set random seed for reproducibility
     random.seed(args.seed)
