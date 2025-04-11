@@ -65,7 +65,7 @@ def main():
     # Create the tensor parallel plan for the model
     # This plan targets Llama model architecture specifically
     # Get all transformer blocks
-    transformer_blocks = model.model.model.layers
+    transformer_blocks = model.model.layers
 
     # Parallelize each transformer block
     for layer_id, transformer_block in enumerate(transformer_blocks):

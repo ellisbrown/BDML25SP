@@ -2,6 +2,12 @@
     "train_micro_batch_size_per_gpu": 56,
     "gradient_accumulation_steps": 1,
     "steps_per_print": 10,
+    "gradient_clipping": 1.0,
+    "bf16": {
+        "enabled": true
+    },
+    "wall_clock_breakdown": true,
+    "zero_allow_untested_optimizer": true,
     "zero_optimization": {
         "stage": 1,
         "contiguous_gradients": true,
@@ -10,12 +16,6 @@
         "reduce_bucket_size": 5e8,
         "allgather_bucket_size": 5e8
     },
-    "gradient_clipping": 1.0,
-    "bf16": {
-        "enabled": true
-    },
-    "wall_clock_breakdown": true,
-    "zero_allow_untested_optimizer": true,
     "optimizer": {
         "type": "AdamW",
         "params": {

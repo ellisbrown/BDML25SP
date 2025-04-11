@@ -16,7 +16,7 @@ bash scripts/hw2/dp.sh
 # Wait for system resources to stabilize
 sleep 30
 
-# Tensor Parallelism 
+# Tensor Parallelism
 echo "================================================"
 echo "Starting Tensor Parallelism experiment..."
 echo "================================================"
