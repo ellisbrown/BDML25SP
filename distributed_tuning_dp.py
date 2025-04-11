@@ -75,12 +75,20 @@ def main():
         mlm=False
     )
 
+    # Add this before creating the DataLoader
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset,
+        num_replicas=int(os.environ.get("WORLD_SIZE", 1)),
+        rank=int(os.environ.get("RANK", 0))
+    )
+
     # Create dataloader
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.per_device_batch_size,
         collate_fn=data_collator,
-        shuffle=True
+        sampler=train_sampler,  # Use the sampler
+        shuffle=False  # Don't use shuffle with a sampler
     )
 
     total_steps = len(train_dataloader)
@@ -91,6 +99,7 @@ def main():
 
     # Training loop
     for epoch in range(args.num_epochs):
+        train_sampler.set_epoch(epoch)  # Important for proper shuffling
         epoch_start_time = time.time()
         model_engine.train()
         total_loss = 0

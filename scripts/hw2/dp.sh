@@ -12,15 +12,19 @@ LOGS_DIR="./logs/hw2/dp"
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$LOGS_DIR"
 
+
 # Run DeepSpeed with 2 GPUs for Data Parallelism
-deepspeed --num_gpus=2 \
+    # --num_gpus=2 \
+deepspeed \
+    --master_port 12341 \
+    --include localhost:2,3 \
     distributed_tuning_dp.py \
     --model_path "$MODEL_PATH" \
     --data_dir "$DATA_DIR" \
     --output_dir "$OUTPUT_DIR" \
     --deepspeed_config "./ds_config_dp.json" \
     --learning_rate 2e-4 \
-    --num_epochs 1 \
+    --num_epochs 3 \
     --max_length 512 \
     --per_device_batch_size 56 \
     --gradient_accumulation_steps 1 \
