@@ -13,7 +13,9 @@ mkdir -p "$OUTPUT_DIR"
 mkdir -p "$LOGS_DIR"
 
 # Run DeepSpeed with 2 GPUs for Tensor Parallelism
-deepspeed --num_gpus=2 \
+deepspeed \
+    --master_port 12343 \
+    --include localhost:0,1 \
     distributed_tuning_tp.py \
     --model_path "$MODEL_PATH" \
     --data_dir "$DATA_DIR" \

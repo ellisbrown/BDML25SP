@@ -74,7 +74,8 @@ def main():
         args=args,
         model=model,
         model_parameters=filter(lambda p: p.requires_grad, model.parameters()),
-        config=ds_config
+        # dont pass here, passed in cli
+        # config=ds_config
     )
 
     # Create data collator for language modeling
