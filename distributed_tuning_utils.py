@@ -244,6 +244,7 @@ def configure_model_base(args, device_map="auto", use_peft=False):
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
+        torch_dtype='auto',
         **model_kwargs
     )
 

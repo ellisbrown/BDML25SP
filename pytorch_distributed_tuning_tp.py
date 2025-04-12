@@ -54,9 +54,13 @@ def main():
 
     # Initialize DeviceMesh for tensor parallelism
     tp_mesh = init_device_mesh("cuda", (world_size,))
+    torch.cuda.set_device(args.local_rank)
+    print(f"Device mesh initialized with {world_size} devices.")
+    print(f"Device mesh: {tp_mesh}")
+    print(f"Rank: {args.local_rank}, Device: {torch.cuda.current_device()}")
 
     # Configure base model
-    model, tokenizer = utils.configure_model_base(args, device_map="cpu")
+    model, tokenizer = utils.configure_model_base(args, device_map=None)
 
     # Move the model to meta device to avoid full initialization on all GPUs
     if hasattr(model, "to_meta"):

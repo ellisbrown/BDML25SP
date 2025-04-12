@@ -12,6 +12,8 @@ LOGS_DIR="./logs/hw2/pytorch_tp"
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$LOGS_DIR"
 
+export CUDA_VISIBLE_DEVICES=0,1
+
 # Run PyTorch distributed with 2 GPUs for Tensor Parallelism
 python -m torch.distributed.run \
     --nproc_per_node=2 \
@@ -27,11 +29,6 @@ python -m torch.distributed.run \
     --per_device_batch_size 8 \
     --gradient_accumulation_steps 1 \
     --seed 42 \
-    --lora_r 8 \
-    --lora_alpha 32 \
-    --lora_dropout 0.1 \
-    --lora_target_modules "q_proj,k_proj,v_proj,o_proj" \
-    --load_in_8bit \
     --use_bf16 \
     --use_gradient_checkpointing \
     --logging_steps 10 \
