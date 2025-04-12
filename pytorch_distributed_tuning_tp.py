@@ -1,11 +1,13 @@
 import os
 import time
 import torch
+import os
 import logging
 import numpy as np
 import random
 from tqdm import tqdm
 import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from transformers import (
     AutoModelForCausalLM,
@@ -18,8 +20,6 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
-    SequenceParallel,
-    PrepareModuleInput,
     parallelize_module,
 )
 
@@ -52,57 +52,66 @@ def main():
     logging.info(f"Starting Tensor Parallel distributed training")
     logging.info(f"Local rank: {args.local_rank}, World size: {world_size}")
 
-    # Initialize DeviceMesh for tensor parallelism
-    tp_mesh = init_device_mesh("cuda", (world_size,))
+    # Use 2D device mesh for DP and TP
+    device_mesh = init_device_mesh("cuda", (1, world_size), mesh_dim_names=("dp", "tp"))
     torch.cuda.set_device(args.local_rank)
-    print(f"Device mesh initialized with {world_size} devices.")
-    print(f"Device mesh: {tp_mesh}")
+
     print(f"Rank: {args.local_rank}, Device: {torch.cuda.current_device()}")
 
-    # Configure base model
-    model, tokenizer = utils.configure_model_base(args, device_map=None)
+    # Configure base model without quantization
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=torch.bfloat16,  # Use bfloat16 for better compatibility
+        trust_remote_code=True,
+    )
 
-    # Move the model to meta device to avoid full initialization on all GPUs
-    if hasattr(model, "to_meta"):
-        model.to_meta()
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    tokenizer.pad_token = tokenizer.eos_token
 
-    # Create the tensor parallel plan for the model
-    # This plan targets Llama model architecture specifically
-    # Get all transformer blocks
-    transformer_blocks = model.model.layers
+    # Enable gradient checkpointing if requested
+    if args.use_gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        logging.info("Gradient checkpointing enabled")
 
-    # Parallelize each transformer block
-    for layer_id, transformer_block in enumerate(transformer_blocks):
-        # Create a plan for this specific layer
-        layer_tp_plan = create_llama_tp_plan(transformer_block)
+    # Move model to correct device
+    model = model.to(f"cuda:{args.local_rank}")
 
-        # Adjust attention module to use the local number of heads
+    # Apply a simplified tensor parallelism plan (similar to Fred's approach)
+    model = parallelize_module(model, device_mesh=device_mesh["tp"], parallelize_plan={
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(),
+    })
+
+    # Adjust the attention head counts in each layer
+    for layer_id, transformer_block in enumerate(model.model.layers):
         attn_layer = transformer_block.self_attn
         if hasattr(attn_layer, "num_heads"):
-            attn_layer.num_heads = attn_layer.num_heads // tp_mesh.size(0)
+            attn_layer.num_heads = attn_layer.num_heads // device_mesh["tp"].size(0)
         elif hasattr(attn_layer, "n_heads"):
-            attn_layer.n_heads = attn_layer.n_heads // tp_mesh.size(0)
+            attn_layer.n_heads = attn_layer.n_heads // device_mesh["tp"].size(0)
             if hasattr(attn_layer, "n_kv_heads"):
-                attn_layer.n_kv_heads = max(1, attn_layer.n_kv_heads // tp_mesh.size(0))
+                attn_layer.n_kv_heads = max(1, attn_layer.n_kv_heads // device_mesh["tp"].size(0))
+        # Adjust config if it exists
+        if hasattr(attn_layer, "config"):
+            if hasattr(attn_layer.config, "num_attention_heads"):
+                attn_layer.config.num_attention_heads = attn_layer.config.num_attention_heads // device_mesh["tp"].size(0)
+            if hasattr(attn_layer.config, "num_key_value_heads"):
+                attn_layer.config.num_key_value_heads = max(1, attn_layer.config.num_key_value_heads // device_mesh["tp"].size(0))
 
-        # Apply tensor parallelism to this layer
-        parallelize_module(
-            module=transformer_block,
-            device_mesh=tp_mesh,
-            parallelize_plan=layer_tp_plan,
-        )
-
-    # Parallelize embedding and output layers
-    model = parallelize_module(
+    # Wrap with FSDP for better handling of parameters
+    model = FSDP(
         model,
-        tp_mesh,
-        {
-            # Handle Llama embedding specifically
-            "model.embed_tokens": RowwiseParallel(),
-            # Handle output layer
-            "lm_head": ColwiseParallel(),
-        }
+        device_mesh=device_mesh["dp"],
+        use_orig_params=False,  # Critical change!
+        forward_prefetch=False
     )
+
+    # Continue with your code for preparing datasets, optimizer, etc.
 
     # Prepare datasets
     train_dataset, eval_dataset = utils.prepare_datasets(args, tokenizer)
@@ -212,54 +221,6 @@ def main():
 
     logging.info("Tensor Parallel distributed training complete!")
 
-def create_llama_tp_plan(transformer_block):
-    """Create a tensor parallel plan for a Llama transformer block"""
-    layer_tp_plan = {}
-
-    # Check if we have self_attn (transformer) or attention (Llama)
-    attn_name = "self_attn" if hasattr(transformer_block, "self_attn") else "attention"
-
-    # Handle attention layers
-    layer_tp_plan[f"{attn_name}.q_proj"] = ColwiseParallel()
-    layer_tp_plan[f"{attn_name}.k_proj"] = ColwiseParallel()
-    layer_tp_plan[f"{attn_name}.v_proj"] = ColwiseParallel()
-    layer_tp_plan[f"{attn_name}.o_proj"] = RowwiseParallel()
-
-    # Find input/output norm layers
-    input_norm_name = None
-    if hasattr(transformer_block, "input_layernorm"):
-        input_norm_name = "input_layernorm"
-    elif hasattr(transformer_block, "attention_norm"):
-        input_norm_name = "attention_norm"
-
-    # Apply SequenceParallel to the norm layers if found
-    if input_norm_name:
-        layer_tp_plan[input_norm_name] = SequenceParallel()
-
-    # Find MLP/feedforward layers
-    if hasattr(transformer_block, "mlp"):
-        mlp_name = "mlp"
-        layer_tp_plan[f"{mlp_name}.gate_proj"] = ColwiseParallel()
-        layer_tp_plan[f"{mlp_name}.down_proj"] = RowwiseParallel()
-        layer_tp_plan[f"{mlp_name}.up_proj"] = ColwiseParallel()
-    elif hasattr(transformer_block, "feed_forward"):
-        mlp_name = "feed_forward"
-        layer_tp_plan[f"{mlp_name}.w1"] = ColwiseParallel()
-        layer_tp_plan[f"{mlp_name}.w2"] = RowwiseParallel()
-        layer_tp_plan[f"{mlp_name}.w3"] = ColwiseParallel()
-
-    # Find post-attention norm layer
-    post_norm_name = None
-    if hasattr(transformer_block, "post_attention_layernorm"):
-        post_norm_name = "post_attention_layernorm"
-    elif hasattr(transformer_block, "ffn_norm"):
-        post_norm_name = "ffn_norm"
-
-    # Apply SequenceParallel to post norm if found
-    if post_norm_name:
-        layer_tp_plan[post_norm_name] = SequenceParallel()
-
-    return layer_tp_plan
 
 if __name__ == "__main__":
     main()

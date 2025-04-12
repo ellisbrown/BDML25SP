@@ -26,8 +26,8 @@ python -m torch.distributed.run \
     --learning_rate 2e-4 \
     --num_epochs 1 \
     --max_length 512 \
-    --per_device_batch_size 8 \
-    --gradient_accumulation_steps 1 \
+    --per_device_batch_size 32 \
+    --gradient_accumulation_steps 2 \
     --seed 42 \
     --use_bf16 \
     --use_gradient_checkpointing \
