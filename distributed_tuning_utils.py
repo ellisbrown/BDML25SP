@@ -116,6 +116,12 @@ def parse_args():
     parser.add_argument("--save_total_limit", type=int, default=1,
                         help="Maximum number of checkpoints to keep")
 
+    # debug flag
+    parser.add_argument("--debug", action="store_true", default=False,
+                        help="Enable debug mode for quick testing")
+    parser.add_argument("--debug_size", type=int, default=1000,
+                        help="Number of samples to use for debugging")
+
     # Parse arguments
     args = parser.parse_args()
 

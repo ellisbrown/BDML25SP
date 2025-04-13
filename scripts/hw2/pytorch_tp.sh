@@ -12,27 +12,27 @@ LOGS_DIR="./logs/hw2/pytorch_tp"
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$LOGS_DIR"
 
-export CUDA_VISIBLE_DEVICES=0,1
+# export CUDA_VISIBLE_DEVICES=0,1
 
 # Run PyTorch distributed with 2 GPUs for Tensor Parallelism
 python -m torch.distributed.run \
     --nproc_per_node=2 \
-    --master_port=12344 \
+    --master_port=12346 \
     pytorch_distributed_tuning_tp.py \
     --model_path "$MODEL_PATH" \
     --data_dir "$DATA_DIR" \
     --output_dir "$OUTPUT_DIR" \
     --log_dir "$LOGS_DIR" \
-    --learning_rate 2e-4 \
-    --num_epochs 1 \
+    --learning_rate 1e-5 \
+    --num_epochs 3 \
     --max_length 512 \
     --per_device_batch_size 32 \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps 4 \
     --seed 42 \
     --use_bf16 \
     --use_gradient_checkpointing \
     --logging_steps 10 \
     --eval_steps 100 \
-    --save_steps 500
+    --save_steps 500 \
 
 echo "PyTorch Tensor Parallel training complete! See $OUTPUT_DIR/training_stats.txt for results."

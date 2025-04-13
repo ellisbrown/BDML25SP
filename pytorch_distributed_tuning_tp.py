@@ -29,6 +29,12 @@ def main():
     # Parse arguments
     args = utils.parse_args()
 
+    if args.debug:
+        args.log_dir += "_debug"
+        args.output_dir += "_debug"
+        os.makedirs(args.log_dir, exist_ok=True)
+        os.makedirs(args.output_dir, exist_ok=True)
+
     # Set up logging
     utils.setup_logging(args.log_dir)
 
@@ -90,13 +96,6 @@ def main():
     # Adjust the attention head counts in each layer
     for layer_id, transformer_block in enumerate(model.model.layers):
         attn_layer = transformer_block.self_attn
-        if hasattr(attn_layer, "num_heads"):
-            attn_layer.num_heads = attn_layer.num_heads // device_mesh["tp"].size(0)
-        elif hasattr(attn_layer, "n_heads"):
-            attn_layer.n_heads = attn_layer.n_heads // device_mesh["tp"].size(0)
-            if hasattr(attn_layer, "n_kv_heads"):
-                attn_layer.n_kv_heads = max(1, attn_layer.n_kv_heads // device_mesh["tp"].size(0))
-        # Adjust config if it exists
         if hasattr(attn_layer, "config"):
             if hasattr(attn_layer.config, "num_attention_heads"):
                 attn_layer.config.num_attention_heads = attn_layer.config.num_attention_heads // device_mesh["tp"].size(0)
@@ -117,6 +116,10 @@ def main():
     train_dataset, eval_dataset = utils.prepare_datasets(args, tokenizer)
     logging.info(f"Train dataset size: {len(train_dataset)} samples")
     logging.info(f"Eval dataset size: {len(eval_dataset)} samples")
+
+    # create a subset of 100 samples for quick testing
+    if args.debug:
+        train_dataset = torch.utils.data.Subset(train_dataset, range(args.debug_size))
 
     # Create data collator for language modeling
     data_collator = DataCollatorForLanguageModeling(
@@ -167,6 +170,10 @@ def main():
 
             # Backward pass
             loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
             optimizer.zero_grad()
 
@@ -176,11 +183,11 @@ def main():
             progress_bar.set_postfix({"loss": avg_loss})
 
             # Log loss
-            if step % args.logging_steps == 0 and args.local_rank == 0:
+            if step % args.logging_steps == 0:
                 logging.info(f"Epoch: {epoch+1}/{args.num_epochs}, Step: {step}/{total_steps}, Loss: {loss.item():.4f}, Avg Loss: {avg_loss:.4f}")
 
             # Evaluate periodically
-            if step % args.eval_steps == 0 and args.local_rank == 0 and step > 0:
+            if step % args.eval_steps == 0 and step > 0:
                 eval_loss, perplexity = utils.evaluate_perplexity(args, model, eval_dataset, tokenizer)
                 logging.info(f"Evaluation - Loss: {eval_loss:.4f}, Perplexity: {perplexity:.2f}")
                 model.train()  # Back to training mode
@@ -191,8 +198,8 @@ def main():
         epoch_times.append(epoch_time)
 
         # Evaluate at the end of each epoch
+        eval_loss, perplexity = utils.evaluate_perplexity(args, model, eval_dataset, tokenizer)
         if args.local_rank == 0:
-            eval_loss, perplexity = utils.evaluate_perplexity(args, model, eval_dataset, tokenizer)
             logging.info(f"Epoch {epoch+1} completed - Time: {epoch_time:.2f}s, Loss: {total_loss/total_steps:.4f}, Eval Loss: {eval_loss:.4f}, Perplexity: {perplexity:.2f}")
 
         # Save model at the end of each epoch
@@ -205,10 +212,11 @@ def main():
 
     # Calculate total training time
     total_time = time.time() - start_time
+    logging.info(f"Total training time: {total_time:.2f} seconds")
 
     # Final evaluation
+    eval_loss, perplexity = utils.evaluate_perplexity(args, model, eval_dataset, tokenizer)
     if args.local_rank == 0:
-        eval_loss, perplexity = utils.evaluate_perplexity(args, model, eval_dataset, tokenizer)
         logging.info(f"Final evaluation - Loss: {eval_loss:.4f}, Perplexity: {perplexity:.2f}")
 
         # Log training statistics
@@ -220,6 +228,21 @@ def main():
         utils.save_training_stats(args, total_time, epoch_times, perplexity, "tensor_parallel")
 
     logging.info("Tensor Parallel distributed training complete!")
+
+    # Clean up
+    if args.local_rank == 0:
+        logging.info("Cleaning up...")
+        torch.distributed.barrier()
+        torch.cuda.empty_cache()
+        logging.info("Cleanup complete!")
+    else:
+        # Wait for other processes to finish
+        torch.distributed.barrier()
+        torch.cuda.empty_cache()
+        logging.info("Cleanup complete!")
+
+    # Destroy the process group
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
