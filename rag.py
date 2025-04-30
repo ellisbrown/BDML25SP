@@ -60,6 +60,8 @@ def parse_args():
                         help="Overlap between chunks (used if re-chunking)")
     parser.add_argument("--top_k", type=int, default=3, # Retrieve top 3 most relevant docs
                         help="Number of documents/chunks to retrieve for context")
+    parser.add_argument("--template_version", type=str, default="simple",
+                        help="Template version for prompt engineering (simple or complex)")
 
     # Generation Parameters
     parser.add_argument("--max_new_tokens", type=int, default=100, # Generate up to 100 new tokens
@@ -221,12 +223,17 @@ def retrieve_chunks(query, index, embedding_model, chunks_list, top_k=3):
     # logging.info(f"Retrieving top {top_k} chunks for query: '{query[:50]}...'")
     start_time = time.time()
     query_vec = embedding_model.encode([query], convert_to_numpy=True)
-    distances, indices = index.search(query_vec, top_k) # Search returns distances and indices
+    distances, indices = index.search(query_vec, top_k) # Search returns distances and indices in order of relevance
     retrieval_time = time.time() - start_time
 
     retrieved_chunks_content = [chunks_list[i] for i in indices[0]]
-    # logging.info(f"Retrieved indices: {indices[0]} in {retrieval_time:.4f} seconds.")
-    # logging.info(f"Retrieved distances: {distances[0]}") # Smaller L2 distance is better
+    logging.info(f"Retrieved indices: {indices[0]} in {retrieval_time:.4f} seconds.")
+    logging.info(f"Retrieved distances: {distances[0]}") # Smaller L2 distance is better
+
+    # assert that the distances in distances[0] are monotonically increasing
+    if not np.all(np.diff(distances[0]) >= 0):
+        raise RuntimeError(f"Distances are not monotonically increasing. Check index consistency. Distances: {distances[0]}")
+
     return retrieved_chunks_content, retrieval_time
 
 # --- Generation ---
@@ -264,28 +271,47 @@ def load_generator_model(model_path, load_in_4bit=False):
     logging.info("Generator model and tokenizer loaded.")
     return model, tokenizer
 
-def generate_answer(query, retrieved_chunks, model, tokenizer, device, max_new_tokens=100, temperature=0.7, top_p=0.9):
+def generate_answer(query, retrieved_chunks, model, tokenizer, device, max_new_tokens=100, temperature=0.7, top_p=0.9, template_version="simple"):
     """Generates an answer based on the query and retrieved context."""
     start_time = time.time()
-    context = "\n\n".join(retrieved_chunks) # Join chunks with double newline
 
     # --- Prompt Engineering ---
-    # Simple prompt template, can be refined
-    prompt = f"""Use the following context to answer the question below. If the context doesn't contain the answer, say "I cannot answer the question based on the provided context."
 
-Context:
+    # Sort retrieved chunks in reverse order of relevance so that the most relevant chunk is the last one
+    retrieved_chunks = retrieved_chunks[::-1]  # since, they're already sorted by the index, we can just reverse the order
+
+    # - complex template
+    if template_version == "complex":
+        context = "\n\n## Passage\n".join(retrieved_chunks) # Join chunks with double newline
+        prompt_template = """# Instructions:
+Use the following context to complete the document's text.
+---
+
+# Context:
+---
+
+## Passage
 {context}
 
-Question: {query}
+# Document
+---
+{query}"""
 
-Answer:"""
+    # - simple template
+    elif template_version == "simple":
+        # simple context template
+        context = "\n\n".join(retrieved_chunks) # Join chunks with double newline
+        prompt_template = "{context}\n\n{query}"
+
+    else:
+        raise ValueError(f"Unknown template version: {template_version}")
 
     # --- Tokenization and Context Length Management ---
     # Ensure the total prompt length doesn't exceed model limits
-    # A common strategy: prioritize query, then fill with context
-    query_tokens = tokenizer.encode(f"\n\nQuestion: {query}\n\nAnswer:", add_special_tokens=False)
-    prompt_template_tokens = tokenizer.encode("Context:\n\n", add_special_tokens=False) # Approx length of template parts
-    max_context_len_tokens = tokenizer.model_max_length - len(query_tokens) - len(prompt_template_tokens) - max_new_tokens - 50 # Conservative buffer
+    # strategy: prioritize query, then fill with context. ensure prompt structure is maintained
+    prompt_wo_ctx = prompt_template.format(context="", query=query)
+    prompt_wo_ctx_tokens = tokenizer.encode(prompt_wo_ctx, add_special_tokens=False)
+    max_context_len_tokens = tokenizer.model_max_length - len(prompt_wo_ctx_tokens) - max_new_tokens - 50 # Conservative buffer
 
     context_tokens = tokenizer.encode(context, add_special_tokens=False)
 
@@ -295,26 +321,19 @@ Answer:"""
         truncated_context_tokens = context_tokens[-max_context_len_tokens:]
         truncated_context = tokenizer.decode(truncated_context_tokens)
         logging.info(f"Truncated context to {len(truncated_context_tokens)} tokens.")
-        # Rebuild prompt with truncated context
-        prompt = f"""Use the following context to answer the question below. If the context doesn't contain the answer, say "I cannot answer the question based on the provided context."
-
-Context:
-{truncated_context}
-
-Question: {query}
-
-Answer:"""
     else:
         logging.info(f"Context length ({len(context_tokens)} tokens) fits within limit.")
+        truncated_context = context
 
+    # Construct the final prompt using the truncated context
+    prompt = prompt_template.format(context=truncated_context, query=query)
 
     # Tokenize the final prompt
     inputs = tokenizer(prompt, return_tensors="pt", truncation=False).to(device) # Do not truncate here, handled above
 
     if inputs['input_ids'].shape[1] >= tokenizer.model_max_length:
          logging.error(f"Final prompt length ({inputs['input_ids'].shape[1]}) still exceeds model max length ({tokenizer.model_max_length}) after attempting truncation. Generation might fail.")
-         # Handle this case - maybe return an error message or try more aggressive truncation
-         return "Error: Prompt too long for model.", 0.0, prompt
+         raise RuntimeError(f"Final prompt length exceeds model max length after truncation... Final length: {inputs['input_ids'].shape[1]}. Max length: {tokenizer.model_max_length}")
 
     # --- Generation ---
     # Generation settings
@@ -329,6 +348,8 @@ Answer:"""
     logging.info("Generating answer...")
     with torch.no_grad(): # Inference doesn't require gradient tracking
         outputs = model.generate(**inputs, **generation_config)
+        loss = outputs.loss.item()
+
     generation_time = time.time() - start_time
 
     # Decode the generated tokens, skipping the prompt part
@@ -360,6 +381,7 @@ def main():
 
     # Load generator model and tokenizer (needed for chunking if using token-based chunker)
     generator_model, generator_tokenizer = load_generator_model(args.model_path, args.load_in_4bit)
+    generator_model.eval() # Set to evaluation mode
 
     # --- Prepare Data and Index ---
     # Load/Chunk Documents & Build/Load Index
@@ -447,7 +469,8 @@ def main():
             args.device,
             args.max_new_tokens,
             args.generation_temperature,
-            args.generation_top_p
+            args.generation_top_p,
+            args.template_version,
         )
         total_generation_time += generation_time
 
