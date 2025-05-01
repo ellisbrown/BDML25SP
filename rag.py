@@ -19,8 +19,8 @@ print("Imports done")
 # --- Logging Setup ---
 # Configure logging to output to both console and a file
 timestamp = time.strftime("%Y%m%d-%H%M%S")
-log_file = f"logs/rag_pipeline_{timestamp}.log"
-os.makedirs("logs", exist_ok=True)
+log_file = f"logs/hw3/rag_pipeline_{timestamp}.log"
+os.makedirs("logs/hw3", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -189,9 +189,11 @@ def build_or_load_index(chunks, embedding_model, index_path, documents_path, chu
                  convert_to_numpy=True,
                  show_progress_bar=True
              )
-             if embeddings_for_training.shape[0] < nlist:
-                 logging.warning(f"Number of training samples ({embeddings_for_training.shape[0]}) is less than nlist ({nlist}). This might lead to poor clustering. Consider more data or smaller nlist.")
-             index.train(embeddings_for_training)
+             num_vectors_for_training = embeddings_for_training.shape[0]
+             if num_vectors_for_training < nlist:
+                 logging.warning(f"Number of training samples ({num_vectors_for_training}) is less than nlist ({nlist}). This might lead to poor clustering. Consider more data or smaller nlist.")
+
+             index.train(num_vectors_for_training, embeddings_for_training)
              logging.info("Index training complete.")
              # Set nprobe (number of clusters to search) - higher means more accurate but slower
              # index.nprobe = 10 # Example value, could be an argument
@@ -208,8 +210,10 @@ def build_or_load_index(chunks, embedding_model, index_path, documents_path, chu
             batch_size=128 # Adjust batch size based on GPU memory
         )
 
-        logging.info(f"Adding {len(chunk_embeddings)} embeddings to the index...")
-        index.add(chunk_embeddings)
+        logging.info(f"Adding {len(chunk_embeddings)} embeddings to the index... {chunk_embeddings.shape}")
+        # index.add(chunk_embeddings)
+        n_vectors = chunk_embeddings.shape[0]
+        index.add(n_vectors, chunk_embeddings) # Corrected line to add embeddings
         logging.info(f"Index built successfully with {index.ntotal} vectors.")
 
         # Save the index and the corresponding chunks/sources
