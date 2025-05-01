@@ -1,14 +1,33 @@
 RAG Perplexity Evaluation Summary
 ==============================
-Timestamp: 2025-04-30 19:05:19
+Timestamp: 2025-04-30 20:30:42
 Evaluated Test Chunks: 17783
 Embedding Model: all-MiniLM-L6-v2
 FAISS Index Type: IndexIVFPQ
 Retrieved Chunks (k): 5
 Generator Model: /root/bdml25sp/datasets/BDML25SP/Llama3.2-3B-converted
-Max Sequence Length: 512
+Max Sequence Length: 2048
 ------------------------------
-Avg Retrieval Time: 0.0061 s
-Avg Perplexity (RAG): 9.67
-Avg Perplexity (Base): 10.76
-Reference Perplexity (Fine-Tuned): 8.18
+Avg Retrieval Time: 0.0060 s
+Avg Perplexity (RAG): 8.9858 (17783/17783 valid)
+Avg Perplexity (Base): 10.7606 (17783/17783 valid)
+==============================
+Arguments Used:
+  model_path: /root/bdml25sp/datasets/BDML25SP/Llama3.2-3B-converted
+  data_dir: ./processed_data
+  output_dir: ./rag_perplexity_output_ivfpq
+  cache_dir: ./dataset_cache
+  faiss_index_path: ./rag_perplexity_output_ivfpq/train_faiss_index.idx
+  train_chunks_path: ./rag_perplexity_output_ivfpq/train_chunks.json
+  test_chunks_path: ./rag_perplexity_output_ivfpq/test_chunks.json
+  train_test_split: 0.9
+  chunk_size: 300
+  chunk_overlap: 50
+  embedding_model: all-MiniLM-L6-v2
+  use_gpu_for_embeddings: True
+  faiss_index_type: IndexIVFPQ
+  top_k: 5
+  eval_batch_size: 4
+  max_length: 2048
+  seed: 42
+  device: cuda
