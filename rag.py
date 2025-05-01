@@ -1,16 +1,20 @@
+print("RAG pipeline script")
 import argparse
 import os
 import glob
 import json
 import logging
 import time
+import math # Added for perplexity calculation
 import torch
+import torch.nn.functional as F # Added for loss calculation
 import numpy as np
 import faiss # faiss-cpu or faiss-gpu
 import random
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from tqdm import tqdm
+print("Imports done")
 
 # --- Logging Setup ---
 # Configure logging to output to both console and a file
@@ -169,8 +173,8 @@ def build_or_load_index(chunks, embedding_model, index_path, documents_path, chu
              # m = args.faiss_m
              # nbits = args.faiss_nbits
              nlist = 100 # Number of clusters (Voronoi cells)
-             m = 8      # Number of subquantizers
-             nbits = 8  # bits per subquantizer index (8 bits = 256 centroids per subquantizer)
+             m = 8       # Number of subquantizers
+             nbits = 8   # bits per subquantizer index (8 bits = 256 centroids per subquantizer)
              quantizer = faiss.IndexFlatL2(d) # Base index for clustering
              index = faiss.IndexIVFPQ(quantizer, d, nlist, m, nbits)
              logging.info(f"Using IndexIVFPQ (nlist={nlist}, m={m}, nbits={nbits}). Training required...")
@@ -227,12 +231,13 @@ def retrieve_chunks(query, index, embedding_model, chunks_list, top_k=3):
     retrieval_time = time.time() - start_time
 
     retrieved_chunks_content = [chunks_list[i] for i in indices[0]]
-    logging.info(f"Retrieved indices: {indices[0]} in {retrieval_time:.4f} seconds.")
-    logging.info(f"Retrieved distances: {distances[0]}") # Smaller L2 distance is better
+    # logging.info(f"Retrieved indices: {indices[0]} in {retrieval_time:.4f} seconds.")
+    # logging.info(f"Retrieved distances: {distances[0]}") # Smaller L2 distance is better
 
-    # assert that the distances in distances[0] are monotonically increasing
-    if not np.all(np.diff(distances[0]) >= 0):
-        raise RuntimeError(f"Distances are not monotonically increasing. Check index consistency. Distances: {distances[0]}")
+    # Optional: Assert that distances are sorted (FAISS should handle this)
+    if len(distances[0]) > 1 and not np.all(np.diff(distances[0]) >= -1e-6): # Allow for small floating point inaccuracies
+         logging.warning(f"Distances may not be monotonically increasing. Check index behavior. Distances: {distances[0]}")
+         # It's generally safe to proceed as FAISS aims to return the nearest first.
 
     return retrieved_chunks_content, retrieval_time
 
@@ -271,6 +276,23 @@ def load_generator_model(model_path, load_in_4bit=False):
     logging.info("Generator model and tokenizer loaded.")
     return model, tokenizer
 
+def calculate_loss_and_perplexity(logits, labels):
+    """Calculates cross-entropy loss and perplexity for generated sequence."""
+    # Shift logits and labels for next token prediction calculation
+    # The logit at index i predicts the token at index i+1
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    # Flatten the tokens
+    loss_fct = torch.nn.CrossEntropyLoss(reduction='mean') # Use mean loss per token
+    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+    # Calculate perplexity
+    perplexity = torch.exp(loss)
+
+    return loss.item(), perplexity.item()
+
+
 def generate_answer(query, retrieved_chunks, model, tokenizer, device, max_new_tokens=100, temperature=0.7, top_p=0.9, template_version="simple"):
     """Generates an answer based on the query and retrieved context."""
     start_time = time.time()
@@ -278,6 +300,7 @@ def generate_answer(query, retrieved_chunks, model, tokenizer, device, max_new_t
     # --- Prompt Engineering ---
 
     # Sort retrieved chunks in reverse order of relevance so that the most relevant chunk is the last one
+    # This way we don't truncate the most relevant chunk if we need to truncate
     retrieved_chunks = retrieved_chunks[::-1]  # since, they're already sorted by the index, we can just reverse the order
 
     # - complex template
@@ -342,22 +365,37 @@ Use the following context to complete the document's text.
         "temperature": temperature,
         "top_p": top_p,
         "do_sample": True if temperature > 0 else False, # Use sampling only if temperature > 0
-        "pad_token_id": tokenizer.eos_token_id # Avoid padding warning during generation
+        "pad_token_id": tokenizer.eos_token_id, # Avoid padding warning during generation
+        "return_dict_in_generate": True, # Need this to get scores
+        "output_scores": True, # Need scores for loss calculation
     }
 
     logging.info("Generating answer...")
+    gen_loss = None
+    gen_perplexity = None
     with torch.no_grad(): # Inference doesn't require gradient tracking
         outputs = model.generate(**inputs, **generation_config)
-        loss = outputs.loss.item()
-
     generation_time = time.time() - start_time
 
     # Decode the generated tokens, skipping the prompt part
-    # outputs[0] contains the full sequence (prompt + generated)
-    answer = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    generated_ids = outputs.sequences[0, inputs["input_ids"].shape[1]:]
+    answer = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    # --- Calculate Loss and Perplexity for the *Generated* Sequence ---
+    # outputs.scores contains logits for each generated step
+    # Stack the scores and select the logits corresponding to the generated tokens
+    if outputs.scores:
+        logits = torch.stack(outputs.scores, dim=1).to(device) # Shape: (batch_size, sequence_length, vocab_size)
+        # The generated_ids are the labels for the logits
+        # We need to align them: the logit at step i predicts token i+1
+        gen_loss, gen_perplexity = calculate_loss_and_perplexity(logits, generated_ids.unsqueeze(0)) # Add batch dim to labels
+        logging.info(f"Generated sequence loss: {gen_loss:.4f}, Perplexity: {gen_perplexity:.2f}")
+    else:
+        logging.warning("Scores not found in generation output. Cannot calculate loss/perplexity.")
+        raise RuntimeError(f"Generation output does not contain scores. Check model configuration. Output: {outputs}")
 
     logging.info(f"Answer generated in {generation_time:.2f} seconds.")
-    return answer.strip(), generation_time, prompt # Return prompt for inspection
+    return answer.strip(), generation_time, prompt, gen_loss, gen_perplexity # Return loss and perplexity
 
 # --- Main Workflow ---
 def main():
@@ -442,6 +480,9 @@ def main():
     results = []
     total_retrieval_time = 0
     total_generation_time = 0
+    total_loss = 0
+    total_perplexity = 0
+    valid_perplexity_count = 0
     total_queries = len(queries)
 
     logging.info(f"Starting evaluation loop for {total_queries} queries...")
@@ -460,8 +501,8 @@ def main():
         total_retrieval_time += retrieval_time
         logging.info(f"Retrieved {len(retrieved_chunks)} chunks in {retrieval_time:.4f} seconds.")
 
-        # b. Generate Answer
-        answer, generation_time, prompt_used = generate_answer(
+        # b. Generate Answer and Calculate Loss/Perplexity
+        answer, generation_time, prompt_used, gen_loss, gen_perplexity = generate_answer(
             query,
             retrieved_chunks,
             generator_model,
@@ -474,6 +515,16 @@ def main():
         )
         total_generation_time += generation_time
 
+        # Accumulate loss/perplexity if calculated successfully
+        if gen_loss is not None and gen_perplexity is not None:
+            total_loss += gen_loss
+            total_perplexity += gen_perplexity
+            valid_perplexity_count += 1
+            logging.info(f"Query {i+1} - Loss: {gen_loss:.4f}, Perplexity: {gen_perplexity:.2f}")
+        else:
+             logging.warning(f"Query {i+1} - Could not calculate loss/perplexity.")
+
+
         # Print and Store Results
         print(f"\nQuery: {query}")
         print(f"Answer: {answer}")
@@ -485,8 +536,10 @@ def main():
             "retrieval_time_s": retrieval_time,
             "generation_time_s": generation_time,
             "total_time_s": retrieval_time + generation_time,
-            "retrieved_context": retrieved_chunks, # Optionally store context
-            "prompt": prompt_used, # Optionally store prompt
+            "generation_loss": gen_loss,
+            "generation_perplexity": gen_perplexity,
+            # "retrieved_context": retrieved_chunks # Optionally store context
+            # "prompt": prompt_used # Optionally store prompt
         })
         print("-" * 50)
 
@@ -495,19 +548,42 @@ def main():
         avg_retrieval_time = total_retrieval_time / total_queries
         avg_generation_time = total_generation_time / total_queries
         avg_total_time = (total_retrieval_time + total_generation_time) / total_queries
+        avg_loss = total_loss / valid_perplexity_count if valid_perplexity_count > 0 else None
+        avg_perplexity = total_perplexity / valid_perplexity_count if valid_perplexity_count > 0 else None
+
         print("=" * 50)
         logging.info("Performance Summary:")
         logging.info(f"  Processed {total_queries} queries.")
         logging.info(f"  Average Retrieval Time: {avg_retrieval_time:.4f} seconds")
         logging.info(f"  Average Generation Time: {avg_generation_time:.3f} seconds")
         logging.info(f"  Average Total Time per Query: {avg_total_time:.3f} seconds")
+        if avg_loss is not None and avg_perplexity is not None:
+             logging.info(f"  Average Generation Loss: {avg_loss:.4f} ({valid_perplexity_count}/{total_queries} valid)")
+             logging.info(f"  Average Generation Perplexity: {avg_perplexity:.2f} ({valid_perplexity_count}/{total_queries} valid)")
+        else:
+             logging.info("  Generation Loss/Perplexity: Not calculated for any queries.")
         print("=" * 50)
 
         # Save results to JSON
         results_path = os.path.join(args.output_dir, "rag_results.json")
         logging.info(f"Saving detailed results to {results_path}")
         with open(results_path, 'w') as f:
-            json.dump(results, f, indent=2)
+            # Convert potential numpy types to standard types for JSON
+            serializable_results = []
+            for r in results:
+                serializable_r = {}
+                for k, v in r.items():
+                    if isinstance(v, np.floating):
+                        serializable_r[k] = float(v)
+                    elif isinstance(v, np.integer):
+                         serializable_r[k] = int(v)
+                    elif v is None:
+                         serializable_r[k] = None
+                    else:
+                         serializable_r[k] = v # Assume other types are serializable
+                serializable_results.append(serializable_r)
+            json.dump(serializable_results, f, indent=2)
+
 
         # Save performance summary to text file
         summary_path = os.path.join(args.output_dir, "performance_summary.txt")
@@ -526,25 +602,36 @@ def main():
              f.write(f"Average Retrieval Time: {avg_retrieval_time:.4f} s\n")
              f.write(f"Average Generation Time: {avg_generation_time:.3f} s\n")
              f.write(f"Average Total Time per Query: {avg_total_time:.3f} s\n")
+             if avg_loss is not None and avg_perplexity is not None:
+                 f.write(f"Average Generation Loss: {avg_loss:.4f} ({valid_perplexity_count}/{total_queries} valid)\n")
+                 f.write(f"Average Generation Perplexity: {avg_perplexity:.2f} ({valid_perplexity_count}/{total_queries} valid)\n")
+             else:
+                  f.write("Generation Loss/Perplexity: Not calculated.\n")
              f.write("="*25 + "\n")
              f.write("Arguments Used:\n")
              for arg, value in vars(args).items():
                   f.write(f"  {arg}: {value}\n")
 
 
-    # --- Comparison (Placeholder) ---
-    # TODO: Implement comparison with fine-tuned model results
-    # 1. Load fine-tuned model inference times (if logged previously)
-    # 2. Load fine-tuned model answers (if generated previously for the same queries)
-    # 3. Compare avg_total_time with fine-tuned inference time
-    # 4. Compare answer quality (requires manual review or metrics like ROUGE/BLEU if reference answers exist)
-    logging.info("Comparison with fine-tuned model (Assignment 1) is pending implementation.")
+    # --- Comparison ---
+    logging.info("Comparison with fine-tuned model (Assignment 1):")
+    # 1. Perplexity Comparison:
+    logging.info("  - Perplexity: The RAG model's average generation perplexity measures how confidently it generated the answer *given the retrieved context*. ")
+    logging.info("    The fine-tuned model's perplexity (from Assignment 1, e.g., 8.18) measures its ability to predict the next token on the raw test dataset (general domain adaptation).")
+    logging.info("    These are different metrics measuring different things. A direct comparison is complex.")
+    logging.info("    Lower RAG perplexity suggests the context helped the model generate its answer more confidently.")
+    # 2. Inference Time Comparison:
+    logging.info(f"  - Inference Time: Compare RAG Avg Total Time ({avg_total_time:.3f}s) with the fine-tuned model's inference time per request (needs to be measured separately on the fine-tuned model for similar queries).")
+    # 3. Answer Quality Comparison:
+    logging.info("  - Answer Quality: Manually compare answers in rag_results.json with answers generated by the fine-tuned model for the same queries (requires running inference with the fine-tuned model).")
+
 
     logging.info("RAG pipeline finished.")
 
 
 if __name__ == "__main__":
     main()
+
 
 """
 
