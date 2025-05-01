@@ -7,6 +7,13 @@ processed_data/
 dataset_cache/
 wandb/
 
+# UV-managed project files
+!/.python-version        # commit Python version file
+!/pyproject.toml         # commit project manifest
+!/uv.lock                # commit lockfile for reproducible installs
+/.venv/                  # ignore UV venv
+
+
 # Created by https://www.toptal.com/developers/gitignore/api/data,linux,macos,python,jupyternotebooks
 # Edit at https://www.toptal.com/developers/gitignore?templates=data,linux,macos,python,jupyternotebooks
 
