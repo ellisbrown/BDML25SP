@@ -1,0 +1,14 @@
+RAG Perplexity Evaluation Summary
+==============================
+Timestamp: 2025-04-30 19:05:19
+Evaluated Test Chunks: 17783
+Embedding Model: all-MiniLM-L6-v2
+FAISS Index Type: IndexIVFPQ
+Retrieved Chunks (k): 5
+Generator Model: /root/bdml25sp/datasets/BDML25SP/Llama3.2-3B-converted
+Max Sequence Length: 512
+------------------------------
+Avg Retrieval Time: 0.0061 s
+Avg Perplexity (RAG): 9.67
+Avg Perplexity (Base): 10.76
+Reference Perplexity (Fine-Tuned): 8.18

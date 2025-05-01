@@ -107,13 +107,85 @@ def split_train_test_files(data_dir, train_ratio=0.9, seed=42):
     logging.info(f"Split {len(all_files)} files into {len(train_files)} train and {len(test_files)} test files.")
     return train_files, test_files
 
-def chunk_texts(texts, sources, chunk_size, chunk_overlap, tokenizer):
-    """Chunks a list of texts using the tokenizer."""
+# Function to hash file paths for caching
+def hash_file_paths(file_paths):
+    """Create a hash from a list of file paths to use as a cache key."""
+    # Sort to ensure consistent hash regardless of order
+    file_paths = sorted(file_paths)
+    # Create a string of all paths and their modification times for better caching
+    paths_string = ""
+    for path in file_paths:
+        mtime = os.path.getmtime(path)
+        paths_string += f"{path}:{mtime};"
+    # Create a hash
+    hash_obj = hashlib.md5(paths_string.encode())
+    return hash_obj.hexdigest()
+
+# Create raw text dataset with caching
+def create_text_dataset(file_paths, cache_dir, chunk_size, tokenizer=None):
+    """Create dataset of raw texts from files with caching."""
+    # Create a hash of the file paths to use as cache key
+    files_hash = hash_file_paths(file_paths)
+    cache_path = os.path.join(cache_dir, f"raw_dataset_{files_hash}")
+
+    # Check if cached dataset exists
+    if os.path.exists(cache_path):
+        logging.info(f"Loading raw text dataset from cache: {cache_path}")
+        return load_from_disk(cache_path)
+
+    logging.info("Cache not found, creating raw text dataset from files...")
+    texts = []
+    sources = []
+
+    for file_path in tqdm(file_paths, desc="Reading text files"):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+                # Store the source file name
+                source = os.path.basename(file_path)
+
+                # Process the text in chunks to avoid loading everything in memory
+                paragraphs = text.split("\n\n")
+                current_chunk = ""
+
+                for para in paragraphs:
+                    # If adding this paragraph would make the chunk too long, save current chunk and start a new one
+                    if len(current_chunk) + len(para) > chunk_size * 4:  # Rough character estimate
+                        if current_chunk:
+                            texts.append(current_chunk)
+                            sources.append(source)
+                        current_chunk = para
+                    else:
+                        current_chunk += "\n\n" + para if current_chunk else para
+
+                # Add the last chunk if it's not empty
+                if current_chunk:
+                    texts.append(current_chunk)
+                    sources.append(source)
+        except Exception as e:
+            logging.error(f"Error processing {file_path}: {e}")
+
+    # Create dataset from texts and sources
+    dataset = Dataset.from_dict({"text": texts, "source": sources})
+
+    # Save to cache
+    logging.info(f"Saving raw text dataset to cache: {cache_path}")
+    dataset.save_to_disk(cache_path)
+
+    return dataset
+
+def chunk_dataset(dataset, chunk_size, chunk_overlap, tokenizer):
+    """Chunks a dataset of texts using the tokenizer."""
     all_chunks = []
     all_chunk_sources = []
-    for text, source in tqdm(zip(texts, sources), total=len(texts), desc="Chunking texts"):
+
+    for item in tqdm(dataset, total=len(dataset), desc="Chunking texts"):
+        text = item["text"]
+        source = item["source"]
+
         if not text.strip():
             continue
+
         tokens = tokenizer.encode(text)
         for i in range(0, len(tokens), chunk_size - chunk_overlap):
             chunk_tokens = tokens[i : i + chunk_size]
@@ -124,26 +196,43 @@ def chunk_texts(texts, sources, chunk_size, chunk_overlap, tokenizer):
             if chunk_text.strip():
                 all_chunks.append(chunk_text)
                 all_chunk_sources.append(source)
+
     return all_chunks, all_chunk_sources
 
+def load_and_chunk_split(file_list, chunk_size, chunk_overlap, tokenizer, cache_dir, split_name="train"):
+    """Loads texts from files, creates datasets with caching, and then chunks them."""
+    # Setup cache directory for this split
+    split_cache_dir = os.path.join(cache_dir, split_name)
+    os.makedirs(split_cache_dir, exist_ok=True)
 
-def load_and_chunk_split(file_list, chunk_size, chunk_overlap, tokenizer, split_name="train"):
-    """Loads texts from files and chunks them."""
-    logging.info(f"Loading and chunking {split_name} files...")
-    texts = []
-    sources = []
-    for file_path in tqdm(file_list, desc=f"Reading {split_name} files"):
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                texts.append(f.read())
-                sources.append(os.path.basename(file_path))
-        except Exception as e:
-            logging.error(f"Error reading {file_path}: {e}")
+    # Create a hash based on split parameters for chunked data cache
+    chunk_params = f"{split_name}_{chunk_size}_{chunk_overlap}_{tokenizer.name_or_path}"
+    chunk_hash = hashlib.md5(chunk_params.encode()).hexdigest()
+    files_hash = hash_file_paths(file_list)
+    chunked_cache_path = os.path.join(split_cache_dir, f"chunked_{files_hash}_{chunk_hash}.json")
 
-    chunks, chunk_sources = chunk_texts(texts, sources, chunk_size, chunk_overlap, tokenizer)
+    # Check if chunked data is already cached
+    if os.path.exists(chunked_cache_path):
+        logging.info(f"Loading chunked {split_name} data from cache: {chunked_cache_path}")
+        with open(chunked_cache_path, 'r') as f:
+            cached_data = json.load(f)
+            return cached_data['chunks'], cached_data['sources']
+
+    # If not cached, load the dataset with caching
+    logging.info(f"Loading and creating {split_name} dataset...")
+    dataset = create_text_dataset(file_list, split_cache_dir, chunk_size, tokenizer)
+
+    # Chunk the dataset
+    logging.info(f"Chunking {split_name} dataset...")
+    chunks, chunk_sources = chunk_dataset(dataset, chunk_size, chunk_overlap, tokenizer)
+
+    # Cache the chunked data
+    logging.info(f"Caching chunked {split_name} data to: {chunked_cache_path}")
+    with open(chunked_cache_path, 'w') as f:
+        json.dump({'chunks': chunks, 'sources': chunk_sources}, f)
+
     logging.info(f"Created {len(chunks)} chunks for {split_name} split.")
     return chunks, chunk_sources
-
 
 # --- Embedding and Indexing (Train Set Only) ---
 def build_or_load_train_index(train_chunks, train_chunk_sources, embedding_model, index_path, chunks_path, index_type="IndexFlatL2"):
@@ -168,7 +257,7 @@ def build_or_load_train_index(train_chunks, train_chunk_sources, embedding_model
              return None, []
 
         # Determine embedding dimension
-        sample_embedding = embedding_model.encode([train_chunks[0]], convert_to_numpy=True)
+        sample_embedding = embedding_model.encode([train_chunks[0]], convert_to_numpy=True, show_progress_bar=True)
         d = sample_embedding.shape[1]
         logging.info(f"Embedding dimension: {d}")
 
@@ -195,7 +284,7 @@ def build_or_load_train_index(train_chunks, train_chunk_sources, embedding_model
         # Encode all training chunks
         logging.info(f"Encoding all {len(train_chunks)} training chunks...")
         chunk_embeddings = embedding_model.encode(
-            train_chunks, convert_to_numpy=True, show_progress_bar=True, batch_size=128
+            train_chunks, convert_to_numpy=True, show_progress_bar=True, batch_size=128,
         )
 
         # Add embeddings to index
@@ -217,7 +306,7 @@ def retrieve_train_context(query_chunk_text, train_index, embedding_model, train
     """Retrieves top_k train chunks relevant to the query (test) chunk."""
     start_time = time.time()
     # Encode the query chunk (which is a test chunk text)
-    query_vec = embedding_model.encode([query_chunk_text], convert_to_numpy=True)
+    query_vec = embedding_model.encode([query_chunk_text], convert_to_numpy=True, show_progress_bar=False)
     # Search the training index
     distances, indices = train_index.search(query_vec, top_k)
     retrieval_time = time.time() - start_time
@@ -355,7 +444,7 @@ def main():
     logging.info(f"Embedding model loaded on device: {embed_device}")
 
     # --- Load, Split, and Chunk Data ---
-    # Check if pre-chunked data exists
+    # Check if we have pre-chunked data
     if os.path.exists(args.train_chunks_path) and os.path.exists(args.test_chunks_path):
         logging.info("Loading pre-chunked train and test data...")
         with open(args.train_chunks_path, 'r') as f:
@@ -369,8 +458,17 @@ def main():
     else:
         logging.info("Pre-chunked data not found. Loading, splitting, and chunking documents...")
         train_files, test_files = split_train_test_files(args.data_dir, args.train_test_split, args.seed)
-        train_chunks, train_chunk_sources = load_and_chunk_split(train_files, args.chunk_size, args.chunk_overlap, tokenizer, "train")
-        test_chunks, _ = load_and_chunk_split(test_files, args.chunk_size, args.chunk_overlap, tokenizer, "test") # Sources not needed for test eval here
+
+        # Using cached loading and chunking
+        train_chunks, train_chunk_sources = load_and_chunk_split(
+            train_files, args.chunk_size, args.chunk_overlap, tokenizer,
+            args.cache_dir, "train"
+        )
+
+        test_chunks, test_chunk_sources = load_and_chunk_split(
+            test_files, args.chunk_size, args.chunk_overlap, tokenizer,
+            args.cache_dir, "test"
+        )
 
         # Save chunked data
         logging.info(f"Saving train chunks to {args.train_chunks_path}")
@@ -378,7 +476,7 @@ def main():
             json.dump({'chunks': train_chunks, 'sources': train_chunk_sources}, f)
         logging.info(f"Saving test chunks to {args.test_chunks_path}")
         with open(args.test_chunks_path, 'w') as f:
-             json.dump({'chunks': test_chunks, 'sources': []}, f) # Save empty sources if not needed
+            json.dump({'chunks': test_chunks, 'sources': test_chunk_sources}, f)
 
     if not train_chunks or not test_chunks:
         logging.error("Failed to load/create train or test chunks. Exiting.")
@@ -405,7 +503,8 @@ def main():
 
     logging.info(f"Starting perplexity evaluation on {len(test_chunks)} test chunks...")
     # Consider batching the evaluation for efficiency if needed
-    for i, test_chunk in enumerate(tqdm(test_chunks, desc="Evaluating Test Chunks")):
+    pbar = tqdm(test_chunks, desc="Evaluating Test Chunks", unit="chunk")
+    for i, test_chunk in enumerate(pbar):
         # 1. Retrieve context from training index based on test chunk
         context_chunks, retrieval_time = retrieve_train_context(
             test_chunk, train_index, embedding_model, train_chunks, args.top_k
@@ -441,12 +540,17 @@ def main():
             valid_base_count += 1
 
         # Log progress periodically
-        if (i + 1) % 50 == 0:
-             logging.info(f"Processed {i+1}/{len(test_chunks)} chunks...")
-             if valid_rag_count > 0:
-                 logging.info(f"  Current Avg PPL (RAG): {total_perplexity_rag / valid_rag_count:.2f}")
-             if valid_base_count > 0:
-                 logging.info(f"  Current Avg PPL (Base): {total_perplexity_base / valid_base_count:.2f}")
+        if (i + 1) % 25 == 0:
+            logging.info(f"Processed {i+1}/{len(test_chunks)} chunks...")
+            if valid_rag_count > 0:
+                logging.info(f"  Current Avg PPL (RAG): {total_perplexity_rag / valid_rag_count:.2f}")
+            if valid_base_count > 0:
+                logging.info(f"  Current Avg PPL (Base): {total_perplexity_base / valid_base_count:.2f}")
+            pbar.set_postfix(
+                ppl_rag=total_perplexity_rag / valid_rag_count if valid_rag_count > 0 else None,
+                ppl_base=total_perplexity_base / valid_base_count if valid_base_count > 0 else None,
+                ret_time=total_retrieval_time / (i + 1) if i > 0 else None,
+            )
 
 
     # --- Final Metrics and Reporting ---
@@ -511,8 +615,8 @@ def main():
         f.write(f"Max Sequence Length: {args.max_length}\n")
         f.write("-" * 30 + "\n")
         f.write(f"Avg Retrieval Time: {avg_retrieval_time:.4f} s\n")
-        f.write(f"Avg Perplexity (RAG): {avg_perplexity_rag:.2f if avg_perplexity_rag is not None else 'N/A'} ({valid_rag_count}/{len(test_chunks)} valid)\n")
-        f.write(f"Avg Perplexity (Base): {avg_perplexity_base:.2f if avg_perplexity_base is not None else 'N/A'} ({valid_base_count}/{len(test_chunks)} valid)\n")
+        f.write(f"Avg Perplexity (RAG): {avg_perplexity_rag:.4f} ({valid_rag_count}/{len(test_chunks)} valid)\n")
+        f.write(f"Avg Perplexity (Base): {avg_perplexity_base:.4f} ({valid_base_count}/{len(test_chunks)} valid)\n")
         f.write("="*30 + "\n")
         f.write("Arguments Used:\n")
         for arg, value in vars(args).items():
