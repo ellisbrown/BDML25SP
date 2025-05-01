@@ -21,7 +21,7 @@ FAISS_INDEX_TYPE="IndexIVFPQ" # Use IVF with Product Quantization
 TOP_K=5 # Retrieve top 5 train chunks for context
 
 # Evaluation Parameters
-MAX_LENGTH=512 # Max sequence length for LLaMA model input
+MAX_LENGTH=2048 # Max sequence length for LLaMA model input
 
 # System Parameters
 SEED=42
